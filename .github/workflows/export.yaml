@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}
 
 env:
-  MAP_GLOB: _maps/**/*sccv_horizon*.dmm
+  MAP_GLOB: maps/**/sccv_horizon.dmm
   OUT_DIR: data/minimaps
   TILE_DIR: data/tiles
   TILE: 512
