@@ -1,4 +1,4 @@
-name: Build & Export (matrix + usage)
+name: Build & Export (streamed tiles + compression)
 
 on:
   push:
@@ -9,63 +9,15 @@ env:
   TILE: 512
   OUT_DIR: data/minimaps
   TILE_DIR: data/tiles
+  ZIP_DIR: data/zips
+  # Optional S3 destination like: s3://my-bucket/aurora-tiles
+  S3_BUCKET: ""            # set in repo/env or Secrets if you want S3 upload
+  S3_PREFIX: ""            # optional subpath
 
 jobs:
-  # 1) Enumerate all .dmm maps and build a JSON matrix
-  enumerate:
-    runs-on: ubuntu-24.04
-    outputs:
-      maps_json: ${{ steps.mk.outputs.maps_json }}
-      count: ${{ steps.mk.outputs.count }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: mk
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-      
-          # Collect .dmm files from both trees
-          files=()
-          [ -d maps  ]  && while IFS= read -r -d '' f; do files+=("$f"); done < <(find maps  -type f -name '*.dmm' -print0 || true)
-          [ -d _maps ] && while IFS= read -r -d '' f; do files+=("$f"); done < <(find _maps -type f -name '*.dmm' -print0 || true)
-      
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "No .dmm files under maps/ or _maps/"; exit 1
-          fi
-      
-          # Build JSON [{path, id}, ...] then compress to one line
-          first=1; json='['
-          for f in "${files[@]}"; do
-            rel="${f#./}"
-            id="$(echo "$rel" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
-            obj=$(jq -n --arg path "$rel" --arg id "$id" '{path:$path,id:$id}')
-            if [ $first -eq 1 ]; then json="$json$obj"; first=0; else json="$json,$obj"; fi
-          done
-          json="$json]"
-          json_compact=$(jq -c . <<<"$json")
-          count=$(jq -r 'length' <<<"$json")
-      
-          # Write multi-line output with a heredoc (safe)
-          {
-            echo "maps_json<<JSON"
-            echo "$json_compact"
-            echo "JSON"
-            echo "count=$count"
-          } >> "$GITHUB_OUTPUT"
-      
-          echo "Found $count maps."
-
-  # 2) Per-map job: render + tile + per-map index + usage
   export:
-    needs: enumerate
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      max-parallel: 3
-      matrix:
-        map: ${{ fromJSON(needs.enumerate.outputs.maps_json) }}
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
@@ -79,129 +31,144 @@ jobs:
           git clone --depth=1 https://github.com/SpaceManiac/SpacemanDMM /tmp/SpacemanDMM
           cd /tmp/SpacemanDMM && cargo build --release --bin dmm-tools
           echo "/tmp/SpacemanDMM/target/release" >> $GITHUB_PATH
+          dmm-tools --help | head -n 1 || true
 
-      - name: Install ImageMagick + jq + numfmt
+      - name: Install tiling & compression tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y imagemagick jq coreutils
-          /usr/bin/convert -version | head -n1
+          sudo apt-get install -y imagemagick pngquant jq awscli
+          /usr/bin/convert -version | head -n 1
+          pngquant --version | head -n 1 || true
 
-      - name: Render minimaps (one PNG per Z)
+      - name: Render → Tile → Compress → Zip → (optional) Upload per map
+        shell: bash
         env:
-          MAP_PATH: ${{ matrix.map.path }}
-          MAP_ID:   ${{ matrix.map.id }}
+          MAP_GLOB_A: "maps/**/*.dmm"
+          MAP_GLOB_B: "_maps/**/*.dmm"
         run: |
-          set -euo pipefail
-          mkdir -p "$OUT_DIR/$MAP_ID"
-          echo "Rendering $MAP_PATH → $OUT_DIR/$MAP_ID"
-          dmm-tools minimap "$MAP_PATH" -o "$OUT_DIR/$MAP_ID"
-          ls -lh "$OUT_DIR/$MAP_ID" || true
+          set -euo nounset
+          # Do NOT set -o pipefail so 'find | head' samples won't kill the job.
+          shopt -s nullglob globstar
 
-      - name: Tile to ${TILE}×${TILE} (row,col from top-left) + per-map index.json
-        env:
-          MAP_ID: ${{ matrix.map.id }}
-          MAP_PATH: ${{ matrix.map.path }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$TILE_DIR/$MAP_ID"
-          zmeta='[]'
-          for png in "$OUT_DIR/$MAP_ID"/*.png; do
-            base="$(basename "$png")"
-            z="${base%.*}"; z="${z##*-}"                 # MapName-3.png -> 3
-            out="$TILE_DIR/$MAP_ID/z$z"
-            mkdir -p "$out"
+          mkdir -p "$OUT_DIR" "$TILE_DIR" "$ZIP_DIR"
 
-            # Crop into 512×512 tiles; name row,col.png (top-left origin); preserve RGBA; pad edges
-            /usr/bin/convert "$png" \
-              -colorspace sRGB -alpha on -type TrueColorAlpha -background none \
-              -crop ${TILE}x${TILE} \
-              -set filename:tile "%[fx:floor(page.y/${TILE})],%[fx:floor(page.x/${TILE})]" \
-              +repage -gravity northwest -extent ${TILE}x${TILE} \
-              +adjoin "$out/%[filename:tile].png"
-
-            # z-level metadata from original PNG
-            w=$(/usr/bin/identify -format '%w' "$png")
-            h=$(/usr/bin/identify -format '%h' "$png")
-            cols=$(( (w + TILE - 1) / TILE ))
-            rows=$(( (h + TILE - 1) / TILE ))
-            zmeta="$(jq -c \
-              --arg z "$z" \
-              --argjson w "$w" \
-              --argjson h "$h" \
-              --argjson rows "$rows" \
-              --argjson cols "$cols" \
-              --arg tile "$TILE" \
-              '. + [{z:($z|tonumber), width_px:$w, height_px:$h, rows:$rows, cols:$cols, tile_size:($tile|tonumber)}]' \
-              <<< "$zmeta")"
+          # Build a list of maps. Add/remove globs as needed.
+          MAPS=()
+          for m in $MAP_GLOB_A $MAP_GLOB_B; do
+            [ -f "$m" ] && MAPS+=("$m")
           done
 
-          # Per-map index.json
-          jq -n \
-            --arg id "$MAP_ID" \
-            --arg tiles_base "data/tiles/$MAP_ID" \
-            --arg minimaps_base "data/minimaps/$MAP_ID" \
-            --arg source_dmm "$MAP_PATH" \
-            --argjson z_levels "$zmeta" \
-            '{map_id:$id, source_dmm:$source_dmm, tiles_base:$tiles_base, minimaps_base:$minimaps_base, z_levels:$z_levels}' \
-            > "$TILE_DIR/$MAP_ID/index.json"
+          if [ "${#MAPS[@]}" -eq 0 ]; then
+            echo "No maps found under maps/** or _maps/**"; exit 1
+          fi
 
-      - name: Disk usage summary (per map)
-        env:
-          MAP_ID: ${{ matrix.map.id }}
-        run: |
-          set -euo pipefail
-          tiles=$(find "$TILE_DIR/$MAP_ID" -type f -name '*.png' | wc -l | tr -d ' ')
-          bytes=$(du -sb "$TILE_DIR/$MAP_ID" | awk '{print $1}')
-          human=$(numfmt --to=iec --suffix=B "$bytes")
-          echo "Tiles: $tiles  Size: $human"
-          {
-            echo "### Map \`$MAP_ID\`"
-            echo ""
-            echo "| Metric | Value |"
-            echo "|---|---:|"
-            echo "| PNG tiles | $tiles |"
-            echo "| Disk usage | $human |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Found ${#MAPS[@]} maps to process."
 
-      - name: Upload per-map artifact
+          for m in "${MAPS[@]}"; do
+            rel="${m#./}"
+            # map_id: safe identifier (path without .dmm, non-alnum → _)
+            map_id="$(echo "$rel" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
+            echo "::group::Processing $m  (id=$map_id)"
+
+            # --- Render minimaps for this map into a temp subdir ---
+            out_map="$OUT_DIR/$map_id"
+            rm -rf "$out_map"; mkdir -p "$out_map"
+            echo "Rendering: $m -> $out_map"
+            dmm-tools minimap "$m" -o "$out_map"
+
+            # --- Tile each Z image, compress, and accumulate per-map metadata ---
+            rm -rf "$TILE_DIR/$map_id"; mkdir -p "$TILE_DIR/$map_id"
+            zmeta='[]'
+
+            for png in "$out_map"/*.png; do
+              base="$(basename "$png")"
+              z="${base%.*}"; z="${z##*-}"                      # YourMap-3.png -> 3
+              out="$TILE_DIR/$map_id/z$z"
+              mkdir -p "$out"
+
+              # Crop into TILE×TILE tiles; top-left origin, name row,col.png; preserve RGBA; pad edges
+              /usr/bin/convert "$png" \
+                -colorspace sRGB -alpha on -type TrueColorAlpha -background none \
+                -crop ${TILE}x${TILE} \
+                -set filename:tile "%[fx:floor(page.y/${TILE})],%[fx:floor(page.x/${TILE})]" \
+                +repage -gravity northwest -extent ${TILE}x${TILE} \
+                +adjoin "$out/%[filename:tile].png"
+
+              # We don't need the big Z PNG anymore
+              rm -f "$png"
+
+              # Lossy-ish palette quantization (huge wins for SS13 art); keep if larger
+              pngquant --quality=70-95 --speed 1 --strip --force --skip-if-larger --ext .png "$out"/*.png || true
+
+              # Gather z-level metadata
+              w=$(/usr/bin/identify -format '%w' "$out/0,0.png" 2>/dev/null || /usr/bin/identify -format '%w' "$out/0,1.png" 2>/dev/null || echo 0)
+              h=$(/usr/bin/identify -format '%h' "$out/0,0.png" 2>/dev/null || /usr/bin/identify -format '%h' "$out/0,1.png" 2>/dev/null || echo 0)
+              # Compute rows/cols from a sentinel tile count (more robust: count files)
+              cols=$(ls "$out"/*.png 2>/dev/null | sed -E 's@.*/([0-9]+),([0-9]+)\.png@\1@' | sort -nu | tail -n1)
+              rows=$(ls "$out"/*.png 2>/dev/null | sed -E 's@.*/([0-9]+),([0-9]+)\.png@\2@' | sort -nu | tail -n1)
+              if [ -z "$cols" ] || [ -z "$rows" ]; then
+                # Fallback using image geometry
+                imgw=$(/usr/bin/identify -format '%w' "$OUT_DIR/$map_id/$base" 2>/dev/null || echo 0)
+                imgh=$(/usr/bin/identify -format '%h' "$OUT_DIR/$map_id/$base" 2>/dev/null || echo 0)
+                cols=$(( (imgw + TILE - 1)/TILE ))
+                rows=$(( (imgh + TILE - 1)/TILE ))
+              else
+                cols=$((cols+1))
+                rows=$((rows+1))
+              fi
+              zmeta="$(jq -c \
+                --arg z "$z" \
+                --argjson rows "$rows" \
+                --argjson cols "$cols" \
+                --arg tile "$TILE" \
+                '. + [{z:($z|tonumber), rows:$rows, cols:$cols, tile_size:($tile|tonumber)}]' \
+                <<< "$zmeta")"
+            done
+
+            # Per-map index.json
+            jq -n \
+              --arg id "$map_id" \
+              --arg tiles_base "data/tiles/$map_id" \
+              --arg minimaps_base "data/minimaps/$map_id" \
+              --arg source_dmm "$rel" \
+              --argjson z_levels "$zmeta" \
+              '{map_id:$id, source_dmm:$source_dmm, tiles_base:$tiles_base, minimaps_base:$minimaps_base, z_levels:$z_levels}' \
+              > "$TILE_DIR/$map_id/index.json"
+
+            # Zip the map tiles + per-map index; then free the tiles on disk
+            ( cd "$TILE_DIR" && zip -qr "../zips/${map_id}.zip" "$map_id" )
+            rm -rf "$TILE_DIR/$map_id"
+
+            # Optionally upload to S3 and delete local zip to save space
+            if [ -n "${S3_BUCKET}" ]; then
+              dest="${S3_BUCKET%/}/${S3_PREFIX:+$S3_PREFIX/}${map_id}.zip"
+              echo "Uploading to ${dest}"
+              aws s3 cp "$ZIP_DIR/${map_id}.zip" "${dest}"
+              rm -f "$ZIP_DIR/${map_id}.zip"
+            fi
+
+            # Cleanup rendered minimaps for this map to save space
+            rm -rf "$out_map"
+            echo "::endgroup::"
+          done
+
+          # Build top-level catalog for whatever remains locally (zips and/or tiles if you kept them)
+          # (Tiles are zipped & removed; the catalog still helps downstream publishing.)
+          maps_json=$(jq -n '[]')
+          for z in "$ZIP_DIR"/*.zip; do
+            [ -f "$z" ] || continue
+            id="$(basename "$z" .zip)"
+            maps_json="$(jq -c --arg id "$id" '. + [$id]' <<< "$maps_json")"
+          done
+          jq -n --arg generated "$(date -u +%FT%TZ)" --argjson maps "$maps_json" \
+            '{generated_at:$generated, zipped_maps:$maps}' > "$ZIP_DIR/index.json"
+
+      - name: Upload artifacts (remaining zips)
+        if: ${{ env.S3_BUCKET == '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: tiles-${{ matrix.map.id }}
+          name: aurora-tiles-zips-${{ github.sha }}
           path: |
-            data/tiles/${{ matrix.map.id }}/**/*.png
-            data/tiles/${{ matrix.map.id }}/index.json
-          if-no-files-found: error
-
-  # 3) Assemble: download all per-map artifacts and build a global catalog
-  assemble:
-    needs: export
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Download all map artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: tiles-*
-          merge-multiple: true
-          path: data/tiles
-
-      - name: Build top-level tiles index.json
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          tmp="data/tiles/_maps.json"
-          jq -s '.' data/tiles/*/index.json > "$tmp"
-          jq -n \
-            --arg generated "$(date -u +%FT%TZ)" \
-            --arg tile "512" \
-            --slurpfile maps "$tmp" \
-            '{generated_at:$generated, tile_size:($tile|tonumber), maps:$maps[0]}' \
-            > data/tiles/index.json
-          rm -f "$tmp"
-          head -n 40 data/tiles/index.json
-
-      - name: Upload global index
-        uses: actions/upload-artifact@v4
-        with:
-          name: tiles-index-${{ github.sha }}
-          path: data/tiles/index.json
+            data/zips/*.zip
+            data/zips/index.json
           if-no-files-found: error
