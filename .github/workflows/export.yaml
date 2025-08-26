@@ -1,10 +1,13 @@
 name: Build & Export (streamed tiles + compression)
+permissions:
+  id-token: write 
+  contents: read
 
 on:
   push:
     branches: [ "master" ]
   workflow_dispatch: {}
-
+  
 env:
   TILE: 512
   OUT_DIR: data/minimaps
@@ -17,7 +20,6 @@ jobs:
   export:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-
     steps:
       - uses: actions/checkout@v4
 
