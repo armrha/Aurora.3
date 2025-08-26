@@ -1,4 +1,4 @@
-name: Build & Export (SpacemanDMM + 512 tiles)
+name: Build & Export (All maps → tiles + indexes)
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}
 
 env:
-  MAP_GLOB: maps/**/sccv_horizon.dmm
+  MAP_GLOB: maps/**/*.dmm     # adjust if your repo uses _maps/ as well
   OUT_DIR: data/minimaps
   TILE_DIR: data/tiles
   TILE: 512
@@ -14,7 +14,8 @@ env:
 jobs:
   export:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
+
     steps:
       - uses: actions/checkout@v4
 
@@ -27,66 +28,116 @@ jobs:
           git clone --depth=1 https://github.com/SpaceManiac/SpacemanDMM /tmp/SpacemanDMM
           cd /tmp/SpacemanDMM && cargo build --release --bin dmm-tools
           echo "/tmp/SpacemanDMM/target/release" >> $GITHUB_PATH
-          dmm-tools --help | head -n 1
+          dmm-tools --help | head -n1
 
-      - name: Render minimaps (one PNG per Z)
+      - name: Render minimaps (one PNG per Z for each .dmm)
+        shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          shopt -s nullglob globstar
           mkdir -p "$OUT_DIR"
-          shopt -s nullglob
           count=0
           for m in $MAP_GLOB; do
-            echo "Rendering $m"
-            dmm-tools minimap "$m" -o "$OUT_DIR"
+            rel="${m#./}"
+            # map_id: path minus .dmm, with non-alnum replaced by _
+            map_id="$(echo "$rel" | sed -E 's/^\.\///; s/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
+            out_map="$OUT_DIR/$map_id"
+            mkdir -p "$out_map"
+            echo "Rendering $m → $out_map"
+            dmm-tools minimap "$m" -o "$out_map"
             count=$((count+1))
           done
-          [ "$count" -gt 0 ] || (echo "No .dmm maps matched MAP_GLOB=$MAP_GLOB" && exit 1)
-          ls -lh "$OUT_DIR"
+          [[ "$count" -gt 0 ]] || { echo "No maps matched: $MAP_GLOB"; exit 1; }
+          find "$OUT_DIR" -type f -name '*.png' | head -n 20
 
-      - name: Install ImageMagick (IM6)
+      - name: Install ImageMagick + jq
         run: |
           sudo apt-get update
-          sudo apt-get install -y imagemagick
+          sudo apt-get install -y imagemagick jq
           /usr/bin/convert -version
 
-      - name: Slice to ${TILE}x${TILE} tiles (top-left origin, row,col.png)
+      - name: Slice to ${TILE}x${TILE} tiles (row,col from top-left) + per-map index.json
+        shell: bash
         run: |
-          set -euxo pipefail
-          mkdir -p "$TILE_DIR"
+          set -euo pipefail
           shopt -s nullglob
-          for png in "$OUT_DIR"/*.png; do
-            base=$(basename "$png")
-            z="${base%.*}"; z="${z##*-}"     # e.g. YourMap-3.png -> 3
-            out="$TILE_DIR/z${z}"
-            mkdir -p "$out"
+          mkdir -p "$TILE_DIR"
 
-            # Crop into tiles; name as row,col.png with top-left origin.
-            # Preserve RGBA; pad edge tiles to exactly TILE×TILE with transparent pixels.
-            /usr/bin/convert "$png" \
-              -colorspace sRGB -alpha on -type TrueColorAlpha -background none \
-              -crop ${TILE}x${TILE} \
-              -set filename:tile "%[fx:floor(page.y/${TILE})],%[fx:floor(page.x/${TILE})]" \
-              +repage -gravity northwest -extent ${TILE}x${TILE} \
-              +adjoin "$out/%[filename:tile].png"
+          for map_dir in "$OUT_DIR"/*; do
+            [ -d "$map_dir" ] || continue
+            # map_id mirrors the OUT_DIR subfolder
+            map_id="$(basename "$map_dir")"
+            map_src="$(echo "$map_id.dmm" | sed -E 's/_/\//g')" || true  # best-effort; not strictly needed
+            zmeta='[]'
+
+            for png in "$map_dir"/*.png; do
+              base="$(basename "$png")"
+              z="${base%.*}"; z="${z##*-}"               # YourMap-3.png -> 3
+              out="$TILE_DIR/$map_id/z$z"
+              mkdir -p "$out"
+
+              # Crop into tiles named row,col.png with top-left origin; preserve RGBA; pad edges
+              /usr/bin/convert "$png" \
+                -colorspace sRGB -alpha on -type TrueColorAlpha -background none \
+                -crop ${TILE}x${TILE} \
+                -set filename:tile "%[fx:floor(page.y/${TILE})],%[fx:floor(page.x/${TILE})]" \
+                +repage -gravity northwest -extent ${TILE}x${TILE} \
+                +adjoin "$out/%[filename:tile].png"
+
+              # Gather z-level metadata
+              w=$(/usr/bin/identify -format '%w' "$png")
+              h=$(/usr/bin/identify -format '%h' "$png")
+              cols=$(( (w + TILE - 1) / TILE ))
+              rows=$(( (h + TILE - 1) / TILE ))
+              zmeta="$(jq -c \
+                --arg z "$z" \
+                --argjson w "$w" \
+                --argjson h "$h" \
+                --argjson rows "$rows" \
+                --argjson cols "$cols" \
+                --arg tile "$TILE" \
+                '. + [{z:($z|tonumber), width_px:$w, height_px:$h, rows:$rows, cols:$cols, tile_size:($tile|tonumber)}]' \
+                <<< "$zmeta")"
+            done
+
+            # Write per-map index.json
+            name_guess="$(basename "$map_id")"
+            jq -n \
+              --arg id "$map_id" \
+              --arg name "$name_guess" \
+              --arg tiles_base "data/tiles/$map_id" \
+              --arg minimaps_base "data/minimaps/$map_id" \
+              --arg source_dmm "$map_src" \
+              --argjson z_levels "$zmeta" \
+              '{map_id:$id, name:$name, source_dmm:$source_dmm, tiles_base:$tiles_base, minimaps_base:$minimaps_base, z_levels:$z_levels}' \
+              > "$TILE_DIR/$map_id/index.json"
           done
 
-      - name: List sample tiles
+      - name: Build top-level tiles index.json
+        shell: bash
         run: |
-          find "$TILE_DIR" -type f | sort | head -n 30
+          set -euo pipefail
+          shopt -s nullglob
+          tmp="$TILE_DIR/_maps.json"
+          jq -s '.' "$TILE_DIR"/*/index.json > "$tmp"
+          jq -n \
+            --arg generated "$(date -u +%FT%TZ)" \
+            --arg map_glob "$MAP_GLOB" \
+            --arg tiles_dir "data/tiles" \
+            --arg minimaps_dir "data/minimaps" \
+            --arg tile "$TILE" \
+            --slurpfile maps "$tmp" \
+            '{generated_at:$generated, tile_size:($tile|tonumber), map_glob:$map_glob, tiles_dir:$tiles_dir, minimaps_dir:$minimaps_dir, maps:$maps[0]}' \
+            > "$TILE_DIR/index.json"
+          rm -f "$tmp"
+          head -n 50 "$TILE_DIR/index.json"
 
-      # Optional: zip per-Z to keep artifact file counts sane
-      - name: Package tiles per Z (optional)
-        run: |
-          set -eux
-          cd "$TILE_DIR"
-          for z in z*; do [ -d "$z" ] && zip -qr "${z}.zip" "$z"; done
-          ls -lh *.zip || true
-
-      - name: Upload tiles
+      - name: Upload tiles + indexes
         uses: actions/upload-artifact@v4
         with:
           name: aurora-tiles-${{ github.sha }}
           path: |
+            data/tiles/**/index.json
+            data/tiles/index.json
             data/tiles/**/*.png
-            data/tiles/*.zip
           if-no-files-found: error
