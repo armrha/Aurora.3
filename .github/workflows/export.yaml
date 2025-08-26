@@ -5,31 +5,40 @@ on:
     branches: [ "master" ]
   workflow_dispatch: {}
 
+env:
+  CI_TRIGGER_REASON: ${{ github.event_name }}
+
 jobs:
   export:
-    runs-on: ubuntu-latest
+    name: Export map tiles
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
-      - name: Checkout fork
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # --- Install BYOND (Linux) ---
-      - name: Install BYOND 516.1667
-        run: |
-          set -eux
-          curl -L https://www.byond.com/download/build/516/516.1667_byond_linux.zip -o byond.zip
-          sudo apt-get update
-          sudo apt-get install -y unzip libstdc++6 libxext6 libx11-6
-          unzip -q byond.zip -d byond
-          sudo byond/install.sh
-          echo "/usr/local/byond/bin" >> $GITHUB_PATH
-          echo "/usr/local/byond/bin" | xargs -I{} test -x "{}/DreamDaemon" && echo "BYOND installed."
+      - name: Set ENV variables (Aurora helper)
+        run: bash dependencies.sh
 
-      # --- Enable exporter defines ---
-      - name: Enable exporter define (autorun + commit label)
+      # BYOND on Linux needs 32-bit libs; mirror their CI
+      - name: Prepare OS Environment
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib zlib1g-dev:i386 libssl-dev:i386 libgcc-s1:i386 libc6:i386
+
+      - name: Install BYOND (Aurora helper)
+        run: |
+          bash tools/ci/install_byond.sh
+          source $HOME/BYOND/byond/bin/byondsetup
+          which DreamMaker
+          which DreamDaemon
+
+      # Write our exporter toggles; _defines.dm is included by map_exporter.dm
+      - name: Enable exporter defines (autorun + commit)
         shell: bash
         run: |
           mkdir -p tools/exporter
@@ -37,79 +46,61 @@ jobs:
             echo "#define MAP_EXPORTER 1"
             echo "#define MAP_EXPORT_AUTORUN 1"
             echo "#define MAP_EXPORT_COMMIT \"${GITHUB_SHA}\""
-            # Optional toggles:
-            # echo "#define MAP_EXPORT_INCLUDE_LIGHTING 1"
+            # echo "#define MAP_EXPORT_INCLUDE_LIGHTING 1"   # uncomment if you want lighting on
             # echo "#define MAP_EXPORT_OUTDIR \"data/exports/tiles\""
           } > tools/exporter/_defines.dm
-          echo "Wrote tools/exporter/_defines.dm:"
+          echo "==== tools/exporter/_defines.dm ===="
           cat tools/exporter/_defines.dm
 
-      # --- Build (Juke build.sh if present; else DreamMaker directly) ---
-      - name: Build DM (+ TGUI if script present)
-        shell: bash
+      # Compile using Aurora’s wrapper (captures logs & exit codes)
+      - name: Compile DM (scripts/dm.sh)
+        env:
+          # add any extra DMFLAGS here; scripts/dm.sh passes -D flags through
+          DMFLAGS: "-DMAP_EXPORTER -DMAP_EXPORT_AUTORUN -DMAP_EXPORT_COMMIT=\\\"${{ github.sha }}\\\""
         run: |
           set -eux
-          if [[ -x tools/build/build.sh ]]; then
-            chmod +x tools/build/build.sh
-            ./tools/build/build.sh dm
-          else
-            # Fallback: directly compile the DME
-            # Adjust the DME name if your repo uses a different one
-            DME="aurorastation.m.dme"
-            if [[ ! -f "$DME" ]]; then
-              echo "Cannot find $DME"; ls -la
-              exit 1
-            fi
-            DreamMaker "$DME"
-          fi
-          # Verify the DMB exists (adjust if the name differs)
-          ls -la *.dmb || ls -la **/*.dmb || true
+          source $HOME/BYOND/byond/bin/byondsetup
+          # scripts/dm.sh usage in their CI: scripts/dm.sh [flags] [-Mmap] aurorastation.dme
+          # We just need a plain compile with our defines:
+          scripts/dm.sh $DMFLAGS aurorastation.dme
+          # Confirm it produced a DMB and the build log looks sane
+          ls -la *.dmb || ls -la **/*.dmb
+          test -f build_log.txt && tail -n +1 build_log.txt | sed -n '1,120p'
 
-      # --- Run DreamDaemon headless to trigger exporter autorun ---
+      # Launch DreamDaemon; exporter autoruns then shutdown()
       - name: Run DreamDaemon to generate exports
-        shell: bash
         run: |
           set -eux
-          # Find a produced .dmb (prefer aurorastation.m.dmb)
+          source $HOME/BYOND/byond/bin/byondsetup
           DMB="$(ls -1 *.dmb 2>/dev/null || true)"
-          if [[ -z "$DMB" ]]; then
+          if [ -z "$DMB" ]; then
             DMB="$(ls -1 **/*.dmb 2>/dev/null | head -n1 || true)"
           fi
-          if [[ -z "$DMB" ]]; then
-            echo "No .dmb found after build."; exit 1
+          if [ -z "$DMB" ]; then
+            echo "No .dmb produced"; exit 1
           fi
           echo "Using DMB: $DMB"
-
-          # Start headless; exporter autoruns then shutdown()
+          # -close returns when world exits; our exporter calls shutdown() at end
           DreamDaemon "$DMB" -invisible -trusted -close &
-
-          # Wait (up to ~2 minutes) for export files to appear
+          # Wait (up to ~2 min) for exporter to write files
           for i in {1..24}; do
-            if [[ -d "data/exports" || -d "data/exports/tiles" ]]; then
-              break
-            fi
+            [ -d data/exports ] && break
             sleep 5
           done
-
-          # One last grace wait for file flush
-          sleep 5
-          pkill -f DreamDaemon || true
+          sleep 3
+          pgrep -f DreamDaemon && pkill -f DreamDaemon || true
 
       - name: List exports
-        shell: bash
         run: |
-          set -eux
-          if [[ -d data/exports ]]; then
+          if [ -d data/exports ]; then
             find data/exports -maxdepth 3 -type f | sort
           else
-            echo "No exports found in data/exports"
-            exit 1
+            echo "No exports found in data/exports"; exit 1
           fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: aurora-exports-${{ github.sha }}
-          path: |
-            data/exports/**
+          path: data/exports/**
           if-no-files-found: error
