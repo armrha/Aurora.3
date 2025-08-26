@@ -2,12 +2,12 @@ name: Build & Export
 
 on:
   push:
-    branches: [ "master" ] 
+    branches: [ "master" ]
   workflow_dispatch: {}
 
 jobs:
   export:
-    runs-on: [self-hosted]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
@@ -16,39 +16,95 @@ jobs:
         with:
           fetch-depth: 0
 
+      # --- Install BYOND (Linux) ---
+      - name: Install BYOND 516.1667
+        run: |
+          set -eux
+          curl -L https://www.byond.com/download/build/516/516.1667_byond_linux.zip -o byond.zip
+          sudo apt-get update
+          sudo apt-get install -y unzip libstdc++6 libxext6 libx11-6
+          unzip -q byond.zip -d byond
+          sudo byond/install.sh
+          echo "/usr/local/byond/bin" >> $GITHUB_PATH
+          echo "/usr/local/byond/bin" | xargs -I{} test -x "{}/DreamDaemon" && echo "BYOND installed."
 
-      - name: Enable exporter define
+      # --- Enable exporter defines ---
+      - name: Enable exporter define (autorun + commit label)
         shell: bash
         run: |
-          echo "#define MAP_EXPORTER" > tools/exporter/_defines.dm
+          mkdir -p tools/exporter
+          {
+            echo "#define MAP_EXPORTER 1"
+            echo "#define MAP_EXPORT_AUTORUN 1"
+            echo "#define MAP_EXPORT_COMMIT \"${GITHUB_SHA}\""
+            # Optional toggles:
+            # echo "#define MAP_EXPORT_INCLUDE_LIGHTING 1"
+            # echo "#define MAP_EXPORT_OUTDIR \"data/exports/tiles\""
+          } > tools/exporter/_defines.dm
+          echo "Wrote tools/exporter/_defines.dm:"
+          cat tools/exporter/_defines.dm
 
-      - name: Build DM + TGUI
-        shell: cmd
+      # --- Build (Juke build.sh if present; else DreamMaker directly) ---
+      - name: Build DM (+ TGUI if script present)
+        shell: bash
         run: |
-          tools\build\build.bat dm
-          
+          set -eux
+          if [[ -x tools/build/build.sh ]]; then
+            chmod +x tools/build/build.sh
+            ./tools/build/build.sh dm
+          else
+            # Fallback: directly compile the DME
+            # Adjust the DME name if your repo uses a different one
+            DME="aurorastation.m.dme"
+            if [[ ! -f "$DME" ]]; then
+              echo "Cannot find $DME"; ls -la
+              exit 1
+            fi
+            DreamMaker "$DME"
+          fi
+          # Verify the DMB exists (adjust if the name differs)
+          ls -la *.dmb || ls -la **/*.dmb || true
+
+      # --- Run DreamDaemon headless to trigger exporter autorun ---
       - name: Run DreamDaemon to generate exports
-        shell: cmd
+        shell: bash
         run: |
-          REM Adjust paths/names to the .dmb produced by your build
-          set DMB=aurorastation.m.dmb
-          if not exist %DMB% (
-            echo DMB not found!
-            dir /b
-            exit /b 1
-          )
-          start "" /B DreamDaemon.exe %DMB% -invisible -trusted -close
-          timeout /t 20 >NUL
+          set -eux
+          # Find a produced .dmb (prefer aurorastation.m.dmb)
+          DMB="$(ls -1 *.dmb 2>/dev/null || true)"
+          if [[ -z "$DMB" ]]; then
+            DMB="$(ls -1 **/*.dmb 2>/dev/null | head -n1 || true)"
+          fi
+          if [[ -z "$DMB" ]]; then
+            echo "No .dmb found after build."; exit 1
+          fi
+          echo "Using DMB: $DMB"
+
+          # Start headless; exporter autoruns then shutdown()
+          DreamDaemon "$DMB" -invisible -trusted -close &
+
+          # Wait (up to ~2 minutes) for export files to appear
+          for i in {1..24}; do
+            if [[ -d "data/exports" || -d "data/exports/tiles" ]]; then
+              break
+            fi
+            sleep 5
+          done
+
+          # One last grace wait for file flush
+          sleep 5
+          pkill -f DreamDaemon || true
 
       - name: List exports
-        shell: cmd
+        shell: bash
         run: |
-          if exist data\exports (
-            dir data\exports
-          ) else (
-            echo No exports found in data\exports
-            exit /b 1
-          )
+          set -eux
+          if [[ -d data/exports ]]; then
+            find data/exports -maxdepth 3 -type f | sort
+          else
+            echo "No exports found in data/exports"
+            exit 1
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
