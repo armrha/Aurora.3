@@ -1,0 +1,31 @@
+// tools/exporter/_defines.dm
+// Build-time toggles for the exporter
+#ifndef MAP_EXPORTER
+#define MAP_EXPORTER 1
+#endif
+
+
+// set to 1 to auto-run the exporter on world init and then quit
+#ifndef MAP_EXPORT_AUTORUN
+#define MAP_EXPORT_AUTORUN 0
+#endif
+
+// include lighting in captures (default 1 = on)
+#ifndef MAP_EXPORT_INCLUDE_LIGHTING
+#define MAP_EXPORT_INCLUDE_LIGHTING 1
+#endif
+
+// base directory for outputs (relative to game root)
+#ifndef MAP_EXPORT_OUTDIR
+#define MAP_EXPORT_OUTDIR "data/exports/tiles"
+#endif
+
+// Tile geometry (image pixels)
+#ifndef MAP_EXPORT_PIXELS_PER_TILE
+#define MAP_EXPORT_PIXELS_PER_TILE 32
+#endif
+
+// Chunk size in map tiles; 16x16 -> 512x512 PNGs
+#ifndef MAP_EXPORT_TILES_PER_CHUNK
+#define MAP_EXPORT_TILES_PER_CHUNK 16
+#endif
