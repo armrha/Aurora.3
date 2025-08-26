@@ -1,4 +1,4 @@
-name: Build & Export
+name: Build & Export (SpacemanDMM + 512 tiles)
 
 on:
   push:
@@ -6,101 +6,87 @@ on:
   workflow_dispatch: {}
 
 env:
-  CI_TRIGGER_REASON: ${{ github.event_name }}
+  MAP_GLOB: _maps/**/*sccv_horizon*.dmm
+  OUT_DIR: data/minimaps
+  TILE_DIR: data/tiles
+  TILE: 512
 
 jobs:
   export:
-    name: Export map tiles
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
-      - name: Set ENV variables (Aurora helper)
-        run: bash dependencies.sh
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      # BYOND on Linux needs 32-bit libs; mirror their CI
-      - name: Prepare OS Environment
-        run: |
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
-          sudo apt-get install -y gcc-multilib zlib1g-dev:i386 libssl-dev:i386 libgcc-s1:i386 libc6:i386
-
-      - name: Install BYOND (Aurora helper)
-        run: |
-          bash tools/ci/install_byond.sh
-          source $HOME/BYOND/byond/bin/byondsetup
-          which DreamMaker
-          which DreamDaemon
-
-      # Write our exporter toggles; _defines.dm is included by map_exporter.dm
-      - name: Enable exporter defines (autorun + commit)
-        shell: bash
-        run: |
-          mkdir -p tools/exporter
-          {
-            echo "#define MAP_EXPORTER 1"
-            echo "#define MAP_EXPORT_AUTORUN 1"
-            echo "#define MAP_EXPORT_COMMIT \"${GITHUB_SHA}\""
-            # echo "#define MAP_EXPORT_INCLUDE_LIGHTING 1"   # uncomment if you want lighting on
-            # echo "#define MAP_EXPORT_OUTDIR \"data/exports/tiles\""
-          } > tools/exporter/_defines.dm
-          echo "==== tools/exporter/_defines.dm ===="
-          cat tools/exporter/_defines.dm
-
-      # Compile using Aurora’s wrapper (captures logs & exit codes)
-      - name: Compile DM (scripts/dm.sh)
-        env:
-          # add any extra DMFLAGS here; scripts/dm.sh passes -D flags through
-          DMFLAGS: "-DMAP_EXPORTER -DMAP_EXPORT_AUTORUN -DMAP_EXPORT_COMMIT=\\\"${{ github.sha }}\\\""
+      - name: Build SpacemanDMM
         run: |
           set -eux
-          source $HOME/BYOND/byond/bin/byondsetup
-          # scripts/dm.sh usage in their CI: scripts/dm.sh [flags] [-Mmap] aurorastation.dme
-          # We just need a plain compile with our defines:
-          scripts/dm.sh $DMFLAGS aurorastation.dme
-          # Confirm it produced a DMB and the build log looks sane
-          ls -la *.dmb || ls -la **/*.dmb
-          test -f build_log.txt && tail -n +1 build_log.txt | sed -n '1,120p'
+          git clone --depth=1 https://github.com/SpaceManiac/SpacemanDMM /tmp/SpacemanDMM
+          cd /tmp/SpacemanDMM && cargo build --release --bin dmm-tools
+          echo "/tmp/SpacemanDMM/target/release" >> $GITHUB_PATH
+          dmm-tools --help | head -n 1
 
-      # Launch DreamDaemon; exporter autoruns then shutdown()
-      - name: Run DreamDaemon to generate exports
+      - name: Render minimaps (one PNG per Z)
         run: |
-          set -eux
-          source $HOME/BYOND/byond/bin/byondsetup
-          DMB="$(ls -1 *.dmb 2>/dev/null || true)"
-          if [ -z "$DMB" ]; then
-            DMB="$(ls -1 **/*.dmb 2>/dev/null | head -n1 || true)"
-          fi
-          if [ -z "$DMB" ]; then
-            echo "No .dmb produced"; exit 1
-          fi
-          echo "Using DMB: $DMB"
-          # -close returns when world exits; our exporter calls shutdown() at end
-          DreamDaemon "$DMB" -invisible -trusted -close &
-          # Wait (up to ~2 min) for exporter to write files
-          for i in {1..24}; do
-            [ -d data/exports ] && break
-            sleep 5
+          set -euxo pipefail
+          mkdir -p "$OUT_DIR"
+          shopt -s nullglob
+          count=0
+          for m in $MAP_GLOB; do
+            echo "Rendering $m"
+            dmm-tools minimap "$m" -o "$OUT_DIR"
+            count=$((count+1))
           done
-          sleep 3
-          pgrep -f DreamDaemon && pkill -f DreamDaemon || true
+          [ "$count" -gt 0 ] || (echo "No .dmm maps matched MAP_GLOB=$MAP_GLOB" && exit 1)
+          ls -lh "$OUT_DIR"
 
-      - name: List exports
+      - name: Install ImageMagick (IM6)
         run: |
-          if [ -d data/exports ]; then
-            find data/exports -maxdepth 3 -type f | sort
-          else
-            echo "No exports found in data/exports"; exit 1
-          fi
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
+          /usr/bin/convert -version
 
-      - name: Upload artifacts
+      - name: Slice to ${TILE}x${TILE} tiles (top-left origin, row,col.png)
+        run: |
+          set -euxo pipefail
+          mkdir -p "$TILE_DIR"
+          shopt -s nullglob
+          for png in "$OUT_DIR"/*.png; do
+            base=$(basename "$png")
+            z="${base%.*}"; z="${z##*-}"     # e.g. YourMap-3.png -> 3
+            out="$TILE_DIR/z${z}"
+            mkdir -p "$out"
+
+            # Crop into tiles; name as row,col.png with top-left origin.
+            # Preserve RGBA; pad edge tiles to exactly TILE×TILE with transparent pixels.
+            /usr/bin/convert "$png" \
+              -colorspace sRGB -alpha on -type TrueColorAlpha -background none \
+              -crop ${TILE}x${TILE} \
+              -set filename:tile "%[fx:floor(page.y/${TILE})],%[fx:floor(page.x/${TILE})]" \
+              +repage -gravity northwest -extent ${TILE}x${TILE} \
+              +adjoin "$out/%[filename:tile].png"
+          done
+
+      - name: List sample tiles
+        run: |
+          find "$TILE_DIR" -type f | sort | head -n 30
+
+      # Optional: zip per-Z to keep artifact file counts sane
+      - name: Package tiles per Z (optional)
+        run: |
+          set -eux
+          cd "$TILE_DIR"
+          for z in z*; do [ -d "$z" ] && zip -qr "${z}.zip" "$z"; done
+          ls -lh *.zip || true
+
+      - name: Upload tiles
         uses: actions/upload-artifact@v4
         with:
-          name: aurora-exports-${{ github.sha }}
-          path: data/exports/**
+          name: aurora-tiles-${{ github.sha }}
+          path: |
+            data/tiles/**/*.png
+            data/tiles/*.zip
           if-no-files-found: error
