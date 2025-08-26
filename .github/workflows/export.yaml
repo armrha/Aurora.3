@@ -1,25 +1,26 @@
-name: Build & Export (streamed tiles + compression)
+name: Build & Export (tiles + hashes + runs + skip-unchanged)
+
 permissions:
-  id-token: write 
+  id-token: write
   contents: read
 
 on:
   push:
     branches: [ "master" ]
   workflow_dispatch: {}
-  
+
 env:
   TILE: 512
   OUT_DIR: data/minimaps
   TILE_DIR: data/tiles
-  ZIP_DIR: data/zips
-  # Optional S3 destination like: s3://my-bucket/aurora-tiles
-  S3_BUCKET: s3://aurora-webtilesbucket          # set in repo/env or Secrets if you want S3 upload
+  S3_BUCKET: s3://aurora-webtilesbucket
+  PUBLIC_BASE: https://aurora-webtilesbucket.s3.amazonaws.com
 
 jobs:
   export:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+
     steps:
       - uses: actions/checkout@v4
 
@@ -27,10 +28,12 @@ jobs:
         id: s3p
         shell: bash
         run: |
-          day=$(date -u +%F)                              # e.g. 2025-08-26
+          set -euo pipefail
+          day=$(date -u +%F)
           sha7=${GITHUB_SHA::7}
           echo "S3_PREFIX=aurora-tiles/${day}/${GITHUB_REF_NAME}/${GITHUB_RUN_ID}-${sha7}" >> "$GITHUB_ENV"
           echo "Will upload under: ${S3_BUCKET%/}/${S3_PREFIX}/"
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -40,82 +43,105 @@ jobs:
           git clone --depth=1 https://github.com/SpaceManiac/SpacemanDMM /tmp/SpacemanDMM
           cd /tmp/SpacemanDMM && cargo build --release --bin dmm-tools
           echo "/tmp/SpacemanDMM/target/release" >> $GITHUB_PATH
-          dmm-tools --help | head -n 1 || true
 
-      - name: Install tiling & compression tools
+      - name: Install ImageMagick + jq + AWS CLI
         run: |
           sudo apt-get update
-          sudo apt-get install -y imagemagick pngquant jq
-          /usr/bin/convert -version | head -n 1
-          pngquant --version | head -n 1 || true
-
-      # 1) Configure AWS creds via OIDC (preferred over static keys)
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          # Either assume a role…
-          role-to-assume: arn:aws:iam::676973469311:role/AuroraWebTilesBucketOIDC
-          aws-region: us-west-2
-          # …or, if you must, use access keys stored as secrets:
-          # aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          # aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      
-      # 2) Install AWS CLI v2
-      - name: Install AWS CLI v2
-        run: |
+          sudo apt-get install -y imagemagick jq unzip
           curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
-          sudo apt-get update && sudo apt-get install -y unzip
           unzip -q awscliv2.zip
           sudo ./aws/install --update
+          /usr/bin/convert -version | head -n 1
           aws --version
 
-      - name: Render → Tile → Compress → Zip → (optional) Upload per map
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::676973469311:role/AuroraWebTilesBucketOIDC
+          aws-region: us-west-2
+
+      # --- NEW: discover previous run & compute change set ---
+      - name: Load previous run & build change list
+        id: diff
         shell: bash
-        env:
-          MAP_GLOB_A: "maps/**/*.dmm"
-          MAP_GLOB_B: "_maps/**/*.dmm"
         run: |
-          set -euo nounset
-          # Do NOT set -o pipefail so 'find | head' samples won't kill the job.
-          shopt -s nullglob globstar
+          set -euo pipefail
+          shopt -s nullglob
 
-          mkdir -p "$OUT_DIR" "$TILE_DIR" "$ZIP_DIR"
+          # Try to fetch global runs.json to find last prefix
+          PREV_PREFIX=""
+          tmp_runs=$(mktemp)
+          if aws s3 cp "${S3_BUCKET%/}/aurora-tiles/runs.json" "$tmp_runs" --only-show-errors; then
+            PREV_PREFIX=$(jq -r '.runs[0].prefix // empty' "$tmp_runs")
+          fi
+          echo "prev_prefix=$PREV_PREFIX" >> "$GITHUB_OUTPUT"
 
-          # Build a list of maps. Add/remove globs as needed.
-          MAPS=()
-          for m in $MAP_GLOB_A $MAP_GLOB_B; do
-            [ -f "$m" ] && MAPS+=("$m")
-          done
-
-          if [ "${#MAPS[@]}" -eq 0 ]; then
-            echo "No maps found under maps/** or _maps/**"; exit 1
+          # Load previous map hashes into an associative map
+          declare -A PREV
+          if [ -n "$PREV_PREFIX" ]; then
+            tmp_hash=$(mktemp)
+            if aws s3 cp "${S3_BUCKET%/}/${PREV_PREFIX}/data/tiles/map_hashes.json" "$tmp_hash" --only-show-errors; then
+              while IFS= read -r k && IFS= read -r v <&3; do PREV["$k"]="$v"; done \
+                < <(jq -r '.maps | keys[]' "$tmp_hash") 3< <(jq -r '.maps[]' "$tmp_hash")
+            fi
           fi
 
-          echo "Found ${#MAPS[@]} maps to process."
+          # Collect candidate .dmm files
+          files=()
+          [ -d maps  ]  && while IFS= read -r -d '' f; do files+=("$f"); done < <(find maps  -type f -name '*.dmm' -print0 || true)
+          [ -d _maps ] && while IFS= read -r -d '' f; do files+=("$f"); done < <(find _maps -type f -name '*.dmm' -print0 || true)
+          [ ${#files[@]} -gt 0 ] || { echo "No .dmm maps found"; exit 1; }
 
-          for m in "${MAPS[@]}"; do
-            rel="${m#./}"
-            # map_id: safe identifier (path without .dmm, non-alnum → _)
-            map_id="$(echo "$rel" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
-            echo "::group::Processing $m  (id=$map_id)"
+          CHANGED='[]'
+          UNCHANGED='[]'
+          for f in "${files[@]}"; do
+            rel="${f#./}"
+            id="$(echo "$rel" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
+            cur=$(git hash-object "$rel")
+            if [ -n "${PREV[$rel]+x}" ] && [ "${PREV[$rel]}" = "$cur" ]; then
+              UNCHANGED=$(jq -c --arg path "$rel" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$UNCHANGED")
+            else
+              CHANGED=$(jq -c --arg path "$rel" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$CHANGED")
+            fi
+          done
 
-            # --- Render minimaps for this map into a temp subdir ---
+          echo "changed<<JSON" >> "$GITHUB_OUTPUT"
+          jq -c . <<<"$CHANGED"       >> "$GITHUB_OUTPUT"
+          echo "JSON"                  >> "$GITHUB_OUTPUT"
+          echo "unchanged<<JSON"       >> "$GITHUB_OUTPUT"
+          jq -c . <<<"$UNCHANGED"     >> "$GITHUB_OUTPUT"
+          echo "JSON"                  >> "$GITHUB_OUTPUT"
+
+          echo "Changed:   $(jq -r 'length' <<<"$CHANGED")"
+          echo "Unchanged: $(jq -r 'length' <<<"$UNCHANGED")"
+
+      # --- Render ONLY changed/new maps ---
+      - name: Render & tile changed maps
+        if: ${{ fromJSON(steps.diff.outputs.changed) != null && (fromJSON(steps.diff.outputs.changed) | length) > 0 }}
+        shell: bash
+        env:
+          CHANGED: ${{ steps.diff.outputs.changed }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p "$OUT_DIR" "$TILE_DIR"
+
+          jq -c '.[]' <<< "$CHANGED" | while read -r m; do
+            rel=$(jq -r '.path' <<< "$m")
+            map_id=$(jq -r '.id'   <<< "$m")
+            echo "::group::Rendering (changed) $rel  (id=$map_id)"
+
             out_map="$OUT_DIR/$map_id"
             rm -rf "$out_map"; mkdir -p "$out_map"
-            echo "Rendering: $m -> $out_map"
-            dmm-tools minimap "$m" -o "$out_map"
+            dmm-tools minimap "$rel" -o "$out_map"
 
-            # --- Tile each Z image, compress, and accumulate per-map metadata ---
             rm -rf "$TILE_DIR/$map_id"; mkdir -p "$TILE_DIR/$map_id"
             zmeta='[]'
-
             for png in "$out_map"/*.png; do
               base="$(basename "$png")"
-              z="${base%.*}"; z="${z##*-}"                      # YourMap-3.png -> 3
+              z="${base%.*}"; z="${z##*-}"
               out="$TILE_DIR/$map_id/z$z"
               mkdir -p "$out"
-
-              # Crop into TILE×TILE tiles; top-left origin, name row,col.png; preserve RGBA; pad edges
               /usr/bin/convert "$png" \
                 -colorspace sRGB -alpha on -type TrueColorAlpha -background none \
                 -crop ${TILE}x${TILE} \
@@ -123,40 +149,15 @@ jobs:
                 +repage -gravity northwest -extent ${TILE}x${TILE} \
                 +adjoin "$out/%[filename:tile].png"
 
-              # We don't need the big Z PNG anymore
-              rm -f "$png"
-
-              # Lossy-ish palette quantization (huge wins for SS13 art); keep if larger
-              pngquant --quality=70-95 --speed 1 --strip --force --skip-if-larger --ext .png "$out"/*.png || true
-
-              # Gather z-level metadata
-              w=$(/usr/bin/identify -format '%w' "$out/0,0.png" 2>/dev/null || /usr/bin/identify -format '%w' "$out/0,1.png" 2>/dev/null || echo 0)
-              h=$(/usr/bin/identify -format '%h' "$out/0,0.png" 2>/dev/null || /usr/bin/identify -format '%h' "$out/0,1.png" 2>/dev/null || echo 0)
-              # Compute rows/cols from a sentinel tile count (more robust: count files)
-              cols=$(ls "$out"/*.png 2>/dev/null | sed -E 's@.*/([0-9]+),([0-9]+)\.png@\1@' | sort -nu | tail -n1)
-              rows=$(ls "$out"/*.png 2>/dev/null | sed -E 's@.*/([0-9]+),([0-9]+)\.png@\2@' | sort -nu | tail -n1)
-              if [ -z "$cols" ] || [ -z "$rows" ]; then
-                # Fallback using image geometry
-                imgw=$(/usr/bin/identify -format '%w' "$OUT_DIR/$map_id/$base" 2>/dev/null || echo 0)
-                imgh=$(/usr/bin/identify -format '%h' "$OUT_DIR/$map_id/$base" 2>/dev/null || echo 0)
-                cols=$(( (imgw + TILE - 1)/TILE ))
-                rows=$(( (imgh + TILE - 1)/TILE ))
-              else
-                cols=$((cols+1))
-                rows=$((rows+1))
-              fi
-              zmeta="$(jq -c \
-                --arg z "$z" \
-                --argjson rows "$rows" \
-                --argjson cols "$cols" \
-                --arg tile "$TILE" \
-                '. + [{z:($z|tonumber), rows:$rows, cols:$cols, tile_size:($tile|tonumber)}]' \
+              w=$(/usr/bin/identify -format '%w' "$png"); h=$(/usr/bin/identify -format '%h' "$png")
+              cols=$(( (w + TILE - 1) / TILE )); rows=$(( (h + TILE - 1) / TILE ))
+              zmeta="$(jq -c --arg z "$z" --arg label "$(basename "$map_id") z$z" \
+                --argjson w "$w" --argjson h "$h" --argjson rows "$rows" --argjson cols "$cols" --arg tile "$TILE" \
+                '. + [{z:($z|tonumber), label:$label, width_px:$w, height_px:$h, rows:$rows, cols:$cols, tile_size:($tile|tonumber)}]' \
                 <<< "$zmeta")"
             done
 
-            # Per-map index.json
-            jq -n \
-              --arg id "$map_id" \
+            jq -n --arg id "$map_id" \
               --arg tiles_base "data/tiles/$map_id" \
               --arg minimaps_base "data/minimaps/$map_id" \
               --arg source_dmm "$rel" \
@@ -164,40 +165,134 @@ jobs:
               '{map_id:$id, source_dmm:$source_dmm, tiles_base:$tiles_base, minimaps_base:$minimaps_base, z_levels:$z_levels}' \
               > "$TILE_DIR/$map_id/index.json"
 
-            # Zip the map tiles + per-map index; then free the tiles on disk
-            ( cd "$TILE_DIR" && zip -qr "../zips/${map_id}.zip" "$map_id" )
-            rm -rf "$TILE_DIR/$map_id"
-
-            # Optionally upload to S3 and delete local zip to save space
-            if [ -n "${S3_BUCKET}" ]; then
-              dest="${S3_BUCKET%/}/${S3_PREFIX:+$S3_PREFIX/}${map_id}.zip"
-              echo "Uploading to ${dest}"
-              aws s3 cp "$ZIP_DIR/${map_id}.zip" "${dest}"
-              rm -f "$ZIP_DIR/${map_id}.zip"
-            fi
-
-            # Cleanup rendered minimaps for this map to save space
-            rm -rf "$out_map"
             echo "::endgroup::"
           done
 
-          # Build top-level catalog for whatever remains locally (zips and/or tiles if you kept them)
-          # (Tiles are zipped & removed; the catalog still helps downstream publishing.)
-          maps_json=$(jq -n '[]')
-          for z in "$ZIP_DIR"/*.zip; do
-            [ -f "$z" ] || continue
-            id="$(basename "$z" .zip)"
-            maps_json="$(jq -c --arg id "$id" '. + [$id]' <<< "$maps_json")"
-          done
-          jq -n --arg generated "$(date -u +%FT%TZ)" --argjson maps "$maps_json" \
-            '{generated_at:$generated, zipped_maps:$maps}' > "$ZIP_DIR/index.json"
+      # --- Synthesize per-map indexes for UNCHANGED maps (point to previous tiles) ---
+      - name: Synthesize unchanged per-map indexes (point to previous run)
+        if: ${{ steps.diff.outputs.prev_prefix != '' && fromJSON(steps.diff.outputs.unchanged) != null && (fromJSON(steps.diff.outputs.unchanged) | length) > 0 }}
+        shell: bash
+        env:
+          UNCHANGED:  ${{ steps.diff.outputs.unchanged }}
+          PREV_PREFIX: ${{ steps.diff.outputs.prev_prefix }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p "$TILE_DIR"
 
-      - name: Upload artifacts (remaining zips)
-        if: ${{ env.S3_BUCKET == '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: aurora-tiles-zips-${{ github.sha }}
-          path: |
-            data/zips/*.zip
-            data/zips/index.json
-          if-no-files-found: error
+          jq -c '.[]' <<< "$UNCHANGED" | while read -r m; do
+            rel=$(jq -r '.path' <<< "$m")
+            map_id=$(jq -r '.id'   <<< "$m")
+            echo "::group::Synthesizing (unchanged) $rel (id=$map_id)"
+            mkdir -p "$TILE_DIR/$map_id"
+            tmp=$(mktemp)
+            # Pull previous per-map index.json
+            aws s3 cp "${S3_BUCKET%/}/${PREV_PREFIX}/data/tiles/${map_id}/index.json" "$tmp" --only-show-errors
+            # Rewrite tiles_base to ABSOLUTE URL of previous tiles (so current run reuses them)
+            jq --arg tb "${PUBLIC_BASE%/}/${PREV_PREFIX}/data/tiles/${map_id}" \
+               '.tiles_base = $tb' "$tmp" > "$TILE_DIR/${map_id}/index.json"
+            echo "::endgroup::"
+          done
+
+      # --- Per-run catalog over BOTH changed + synthesized indexes ---
+      - name: Build per-run catalog (data/tiles/index.json)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p "$(dirname "$TILE_DIR/index.json")"
+          tmp="$TILE_DIR/_maps.json"
+          jq -s '.' "$TILE_DIR"/*/index.json > "$tmp"
+          jq -n \
+            --arg generated "$(date -u +%FT%TZ)" \
+            --arg tile "$TILE" \
+            --slurpfile maps "$tmp" \
+            '{generated_at:$generated, tile_size:($tile|tonumber), maps:$maps[0]}' \
+            > "$TILE_DIR/index.json"
+          rm -f "$tmp"
+
+      # --- Compute & upload map_hashes.json for THIS run ---
+      - name: Compute map_hashes.json (git blob hashes of .dmm)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          jq -n --arg commit "$GITHUB_SHA" --arg gen "$(date -u +%FT%TZ)" \
+            '{commit_full:$commit, generated_at:$gen, maps:{}}' > map_hashes.json
+          while IFS= read -r -d '' f; do
+            h=$(git hash-object "$f")
+            jq --arg p "$f" --arg h "$h" '.maps[$p]=$h' map_hashes.json > x && mv x map_hashes.json
+          done < <(find maps _maps -type f -name '*.dmm' -print0 2>/dev/null)
+          cat map_hashes.json
+
+      # --- Upload (tiles for CHANGED only), then JSON indices and hashes ---
+      - name: Upload tiles (changed only; immutable)
+        if: ${{ fromJSON(steps.diff.outputs.changed) != null && (fromJSON(steps.diff.outputs.changed) | length) > 0 }}
+        shell: bash
+        env:
+          CHANGED: ${{ steps.diff.outputs.changed }}
+        run: |
+          set -euo pipefail
+          jq -c '.[]' <<< "$CHANGED" | while read -r m; do
+            map_id=$(jq -r '.id' <<< "$m")
+            aws s3 sync "$TILE_DIR/$map_id" "${S3_BUCKET%/}/${S3_PREFIX}/data/tiles/$map_id" \
+              --only-show-errors \
+              --exclude "*" --include "*.png" \
+              --cache-control "public, max-age=31536000, immutable"
+          done
+
+      - name: Upload JSON indices (per-map + per-run + hashes)
+        run: |
+          # Upload all per-map indexes and the per-run catalog for THIS run
+          find "$TILE_DIR" -type f -name '*.json' -print0 | while IFS= read -r -d '' f; do
+            aws s3 cp "$f" "${S3_BUCKET%/}/${S3_PREFIX}/${f}" \
+              --only-show-errors \
+              --content-type "application/json" \
+              --cache-control "public, max-age=60, must-revalidate"
+          done
+          # Upload hashes manifest
+          aws s3 cp map_hashes.json "${S3_BUCKET%/}/${S3_PREFIX}/data/tiles/map_hashes.json" \
+            --only-show-errors \
+            --content-type "application/json" \
+            --cache-control "public, max-age=60, must-revalidate"
+
+      # --- Update global runs.json history ---
+      - name: Update global runs.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          tiles=$(find "$TILE_DIR" -type f -name '*.png' | wc -l | tr -d ' ')
+          bytes=$(du -sb "$TILE_DIR" | awk '{print $1}')
+          maps=$(find "$TILE_DIR" -mindepth 2 -maxdepth 2 -name index.json | wc -l | tr -d ' ')
+          now=$(date -u +%FT%TZ)
+          sha7=${GITHUB_SHA::7}
+          entry=$(jq -n \
+            --arg prefix "$S3_PREFIX" \
+            --arg branch "${GITHUB_REF_NAME}" \
+            --arg commit "$sha7" \
+            --arg now "$now" \
+            --argjson tiles "$tiles" \
+            --argjson bytes "$bytes" \
+            --argjson maps "$maps" \
+            '{prefix:$prefix, branch:$branch, commit:$commit, generated_at:$now, map_count:$maps, tile_count:$tiles, bytes:$bytes}')
+          tmp_old=$(mktemp)
+          if aws s3 cp "${S3_BUCKET%/}/aurora-tiles/runs.json" "$tmp_old" --only-show-errors; then
+            jq --argjson new "$entry" '
+              .generated_at = now | todateiso8601
+              | .runs = ([ $new ] + (.runs // []))
+              | .runs = (reduce .runs[] as $r ([]; . + (if ([.[][].prefix] | index($r.prefix)) then [] else [$r] end)))
+              | .runs = (.runs | sort_by(.generated_at) | reverse)
+            ' "$tmp_old" > runs.json
+          else
+            jq -n --arg gen "$now" --arg tile "$TILE" --argjson new "$entry" \
+              '{generated_at:$gen, tile_size:($tile|tonumber), runs:[ $new ]}' > runs.json
+          fi
+          aws s3 cp runs.json "${S3_BUCKET%/}/aurora-tiles/runs.json" \
+            --only-show-errors \
+            --content-type "application/json" \
+            --cache-control "public, max-age=60, must-revalidate"
+
+      - name: Where to read catalogs
+        run: |
+          echo "Per-run catalog:"
+          echo "  ${PUBLIC_BASE%/}/${S3_PREFIX}/data/tiles/index.json"
+          echo "Global history:"
+          echo "  ${PUBLIC_BASE%/}/aurora-tiles/runs.json"
