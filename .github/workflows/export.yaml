@@ -24,12 +24,17 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
+      
+          # Collect .dmm files from both trees
           files=()
-          [ -d maps ]  && while IFS= read -r -d '' f; do files+=("$f"); done < <(find maps  -type f -name '*.dmm' -print0 || true)
+          [ -d maps  ]  && while IFS= read -r -d '' f; do files+=("$f"); done < <(find maps  -type f -name '*.dmm' -print0 || true)
           [ -d _maps ] && while IFS= read -r -d '' f; do files+=("$f"); done < <(find _maps -type f -name '*.dmm' -print0 || true)
+      
           if [ ${#files[@]} -eq 0 ]; then
             echo "No .dmm files under maps/ or _maps/"; exit 1
           fi
+      
+          # Build JSON [{path, id}, ...] then compress to one line
           first=1; json='['
           for f in "${files[@]}"; do
             rel="${f#./}"
@@ -38,9 +43,18 @@ jobs:
             if [ $first -eq 1 ]; then json="$json$obj"; first=0; else json="$json,$obj"; fi
           done
           json="$json]"
-          echo "maps_json=$json" >> "$GITHUB_OUTPUT"
-          echo "count=$(jq -r 'length' <<<"$json")" >> "$GITHUB_OUTPUT"
-          echo "Found $(jq -r 'length' <<<"$json") maps."
+          json_compact=$(jq -c . <<<"$json")
+          count=$(jq -r 'length' <<<"$json")
+      
+          # Write multi-line output with a heredoc (safe)
+          {
+            echo "maps_json<<JSON"
+            echo "$json_compact"
+            echo "JSON"
+            echo "count=$count"
+          } >> "$GITHUB_OUTPUT"
+      
+          echo "Found $count maps."
 
   # 2) Per-map job: render + tile + per-map index + usage
   export:
