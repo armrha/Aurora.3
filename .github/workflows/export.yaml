@@ -11,8 +11,7 @@ env:
   TILE_DIR: data/tiles
   ZIP_DIR: data/zips
   # Optional S3 destination like: s3://my-bucket/aurora-tiles
-  S3_BUCKET: ""            # set in repo/env or Secrets if you want S3 upload
-  S3_PREFIX: ""            # optional subpath
+  S3_BUCKET: s3://aurora-webtilesbucket          # set in repo/env or Secrets if you want S3 upload
 
 jobs:
   export:
@@ -22,6 +21,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Compute S3 prefix (date/branch/run/sha)
+        id: s3p
+        shell: bash
+        run: |
+          day=$(date -u +%F)                              # e.g. 2025-08-26
+          sha7=${GITHUB_SHA::7}
+          echo "S3_PREFIX=aurora-tiles/${day}/${GITHUB_REF_NAME}/${GITHUB_RUN_ID}-${sha7}" >> "$GITHUB_ENV"
+          echo "Will upload under: ${S3_BUCKET%/}/${S3_PREFIX}/"
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -36,9 +43,29 @@ jobs:
       - name: Install tiling & compression tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y imagemagick pngquant jq awscli
+          sudo apt-get install -y imagemagick pngquant jq
           /usr/bin/convert -version | head -n 1
           pngquant --version | head -n 1 || true
+
+      # 1) Configure AWS creds via OIDC (preferred over static keys)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Either assume a role…
+          role-to-assume: arn:aws:iam::676973469311:role/AuroraWebTilesBucketOIDC
+          aws-region: us-west-2
+          # …or, if you must, use access keys stored as secrets:
+          # aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          # aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      
+      # 2) Install AWS CLI v2
+      - name: Install AWS CLI v2
+        run: |
+          curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+          sudo apt-get update && sudo apt-get install -y unzip
+          unzip -q awscliv2.zip
+          sudo ./aws/install --update
+          aws --version
 
       - name: Render → Tile → Compress → Zip → (optional) Upload per map
         shell: bash
