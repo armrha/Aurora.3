@@ -82,8 +82,11 @@ jobs:
           if [ -n "$PREV_PREFIX" ]; then
             tmp_hash=$(mktemp)
             if aws s3 cp "${S3_BUCKET%/}/${PREV_PREFIX}/data/tiles/map_hashes.json" "$tmp_hash" --only-show-errors; then
-              while IFS= read -r k && IFS= read -r v <&3; do PREV["$k"]="$v"; done \
-                < <(jq -r '.maps | keys[]' "$tmp_hash") 3< <(jq -r '.maps[]' "$tmp_hash")
+              # normalize keys from previous run
+              while IFS= read -r k && IFS= read -r v <&3; do 
+                k="${k#./}"                               # <-- normalize
+                PREV["$k"]="$v"
+              done < <(jq -r '.maps | keys[]' "$tmp_hash") 3< <(jq -r '.maps[]' "$tmp_hash")
             fi
           fi
 
@@ -171,7 +174,7 @@ jobs:
 
       # --- Synthesize per-map indexes for UNCHANGED maps (point to previous tiles) ---
       - name: Synthesize unchanged per-map indexes (point to previous run)
-        if: steps.diff.outputs.changed != '[]'
+        if: steps.diff.outputs.prev_prefix != '' && steps.diff.outputs.unchanged != '[]'
         shell: bash
         env:
           UNCHANGED:  ${{ steps.diff.outputs.unchanged }}
@@ -218,9 +221,11 @@ jobs:
           shopt -s nullglob
           jq -n --arg commit "$GITHUB_SHA" --arg gen "$(date -u +%FT%TZ)" \
             '{commit_full:$commit, generated_at:$gen, maps:{}}' > map_hashes.json
+          
           while IFS= read -r -d '' f; do
+            rel="${f#./}"                                 # <-- normalize
             h=$(git hash-object "$f")
-            jq --arg p "$f" --arg h "$h" '.maps[$p]=$h' map_hashes.json > x && mv x map_hashes.json
+            jq --arg p "$rel" --arg h "$h" '.maps[$p]=$h' map_hashes.json > x && mv x map_hashes.json
           done < <(find maps _maps -type f -name '*.dmm' -print0 2>/dev/null)
           cat map_hashes.json
       - run: |
@@ -267,6 +272,7 @@ jobs:
           maps=$(find "$TILE_DIR" -mindepth 2 -maxdepth 2 -name index.json | wc -l | tr -d ' ')
           now=$(date -u +%FT%TZ)
           sha7=${GITHUB_SHA::7}
+          
           entry=$(jq -n \
             --arg prefix "$S3_PREFIX" \
             --arg branch "${GITHUB_REF_NAME}" \
@@ -276,23 +282,28 @@ jobs:
             --argjson bytes "$bytes" \
             --argjson maps "$maps" \
             '{prefix:$prefix, branch:$branch, commit:$commit, generated_at:$now, map_count:$maps, tile_count:$tiles, bytes:$bytes}')
+          
           tmp_old=$(mktemp)
           if aws s3 cp "${S3_BUCKET%/}/aurora-tiles/runs.json" "$tmp_old" --only-show-errors; then
             jq --argjson new "$entry" '
-              .generated_at = now | todateiso8601
+              .generated_at = (now | todateiso8601)
               | .runs = ([ $new ] + (.runs // []))
-              | .runs = (reduce .runs[] as $r ([]; . + (if ([.[][].prefix] | index($r.prefix)) then [] else [$r] end)))
+              | .runs = (
+                  # de-dup by prefix
+                  (reduce .runs[] as $r ({}; .[$r.prefix] = $r)) 
+                  | to_entries | map(.value)
+                )
               | .runs = (.runs | sort_by(.generated_at) | reverse)
             ' "$tmp_old" > runs.json
           else
             jq -n --arg gen "$now" --arg tile "$TILE" --argjson new "$entry" \
               '{generated_at:$gen, tile_size:($tile|tonumber), runs:[ $new ]}' > runs.json
           fi
+          
           aws s3 cp runs.json "${S3_BUCKET%/}/aurora-tiles/runs.json" \
             --only-show-errors \
             --content-type "application/json" \
             --cache-control "public, max-age=60, must-revalidate"
-
       - name: Where to read catalogs
         run: |
           echo "Per-run catalog:"
