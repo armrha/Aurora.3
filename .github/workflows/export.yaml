@@ -91,30 +91,56 @@ jobs:
             echo "No previous map_hashes.json found at prefix."
           fi
 
-      # --- Compute map_hashes.json (git blob hashes of .dmm), deterministic order ---
       - name: Compute map_hashes.json (git blob hashes of .dmm)
         id: curhash
         shell: bash
         run: |
-          set -euo pipefail
-          shopt -s nullglob
+          set -Eeuo pipefail
+          set -x
       
+          # Seed file
           jq -n --arg commit "$GITHUB_SHA" --arg gen "$(date -u +%FT%TZ)" \
             '{commit_full:$commit, generated_at:$gen, maps:{}}' > map_hashes.json
       
-          # Gather files in a stable order
-          files=()
-          [ -d maps  ]  && while IFS= read -r f; do files+=("$f"); done < <(find maps  -type f -name '*.dmm' | LC_ALL=C sort)
-          [ -d _maps ] && while IFS= read -r f; do files+=("$f"); done < <(find _maps -type f -name '*.dmm' | LC_ALL=C sort)
+          # Build a null-delimited, sorted list of .dmm files from both roots (if they exist)
+          tmp_list="$(mktemp)"
+          {
+            [ -d maps  ]  && find maps  -type f -name '*.dmm' -print0 || true
+            [ -d _maps ] && find _maps -type f -name '*.dmm' -print0 || true
+          } | LC_ALL=C sort -z > "$tmp_list"
       
-          for f in "${files[@]}"; do
+          # If no files, fail early with a clear message
+          if [ ! -s "$tmp_list" ]; then
+            echo "No .dmm maps found in ./maps or ./_maps" >&2
+            exit 1
+          fi
+      
+          # Update JSON in a temp file to avoid partial writes
+          tmp_json="$(mktemp)"
+          cp map_hashes.json "$tmp_json"
+      
+          # Iterate null-delimited files
+          while IFS= read -r -d '' f; do
             rel="${f#./}"
-            h=$(git hash-object "$f")
-            jq --arg p "$rel" --arg h "$h" '.maps[$p]=$h' map_hashes.json > x && mv x map_hashes.json
-          done
+            h="$(git hash-object "$f")"
+            jq --arg p "$rel" --arg h "$h" '.maps[$p]=$h' "$tmp_json" > "$tmp_json.next"
+            mv "$tmp_json.next" "$tmp_json"
+          done < "$tmp_list"
       
-          echo "current_hash_file=map_hashes.json" >> "$GITHUB_OUTPUT"
-          
+          mv "$tmp_json" map_hashes.json
+      
+          # Optional: quick debug summary so we can sanity-check the shape
+          echo "::group::DEBUG map_hashes.json (current)"
+          jq -r '
+            "generated_at: \(.generated_at // "n/a")",
+            "commit_full: \(.commit_full // "n/a")",
+            "MAP COUNT: \((.maps // {}) | keys | length)",
+            "SAMPLE KEYS:",
+            ((.maps // {}) | keys | sort | .[0:20][] // empty)
+          ' map_hashes.json
+          echo "::endgroup::"
+      
+          echo "cur_hash_file=map_hashes.json" >> "$GITHUB_OUTPUT"
           - name: Compare map hashes and build change lists
             id: diff
             shell: bash
