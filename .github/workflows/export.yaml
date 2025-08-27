@@ -148,48 +148,82 @@ jobs:
         id: diff
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
       
           CUR="${{ steps.curhash.outputs.cur_hash_file }}"
           PREV="${{ steps.prevhash.outputs.prev_hash_file }}"
+          : "${CUR:?cur_hash_file missing}"
       
-          echo "::group::DEBUG current map_hashes.json ($CUR)"
-          if [ -f "$CUR" ]; then
-            echo "File size: $(stat -c%s "$CUR") bytes"
-            head -n 400 "$CUR"
-          else
-            echo "MISSING $CUR"
-          fi
-          echo "::endgroup::"
+          touch changed_maps.txt
       
-          echo "::group::DEBUG previous map_hashes.json ($PREV)"
-          if [ -n "$PREV" ] && [ -f "$PREV" ]; then
-            echo "File size: $(stat -c%s "$PREV") bytes"
-            head -n 400 "$PREV"
-          else
-            echo "MISSING $PREV"
-          fi
-          echo "::endgroup::"
-      
-          if [ -z "$PREV" ]; then
-            echo "No previous hash file, treat all as changed."
-            jq -r '.maps | keys[]' "$CUR" > changed_maps.txt
-          else
+          if [ -n "${PREV:-}" ] && [ -f "$PREV" ]; then
             echo "Hash diff"
-            python .github/scripts/compare_map_hashes.py "$PREV" "$CUR" \
+            python3 .github/scripts/compare_map_hashes.py "$PREV" "$CUR" \
               --changed-out changed_maps.txt --summary-out hash_diff_summary.txt | tee hashdiff.out
+          else
+            # ---- FIRST RUN: treat all as changed ----
+            jq -r '.maps | keys[]' "$CUR" > changed_maps.txt
+            printf "added:0 removed:0 changed:%s same:0\n" "$(wc -l < changed_maps.txt | tr -d ' ')" > hash_diff_summary.txt
+            printf "any_changed=true\nchanged_count=%s\nadded_count=0\nremoved_count=0\n" "$(wc -l < changed_maps.txt | tr -d ' ')" > hashdiff.out
           fi
       
           echo "---- summary ----"
-          if [ -f hash_diff_summary.txt ]; then
-            cat hash_diff_summary.txt
-          else
-            echo "No summary produced"
-          fi
+          cat hash_diff_summary.txt
       
-          echo "::group::DEBUG changed_maps.txt"
-          cat changed_maps.txt || echo "No changed maps"
-          echo "::endgroup::"
+          # Build CHANGED JSON [{path,id}]
+          CHANGED='[]'
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            id="$(echo "$path" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
+            CHANGED=$(jq -c --arg path "$path" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$CHANGED")
+          done < changed_maps.txt
+      
+          # Build UNCHANGED JSON via set difference (will be [] on first run)
+          tmp_all=$(mktemp); jq -r '.maps | keys[]' "$CUR" | LC_ALL=C sort > "$tmp_all"
+          tmp_chg=$(mktemp); LC_ALL=C sort changed_maps.txt > "$tmp_chg"
+          tmp_unchanged=$(mktemp); comm -23 "$tmp_all" "$tmp_chg" > "$tmp_unchanged"
+      
+          UNCHANGED='[]'
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            id="$(echo "$path" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
+            UNCHANGED=$(jq -c --arg path "$path" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$UNCHANGED")
+          done < "$tmp_unchanged"
+      
+          {
+            echo "changed<<JSON"
+            jq -c . <<<"$CHANGED"
+            echo "JSON"
+            echo "unchanged<<JSON"
+            jq -c . <<<"$UNCHANGED"
+            echo "JSON"
+          } >> "$GITHUB_OUTPUT"
+      
+          # Bubble comparator flags to outputs (any_changed, counts)
+          while IFS='=' read -r k v; do
+            echo "$k=$v" >> "$GITHUB_OUTPUT"
+          done < hashdiff.out
+          # prev keys (only if a prev hash exists)
+          tmp_prev=$(mktemp)
+          if [ -n "${PREV:-}" ] && [ -f "$PREV" ]; then
+            jq -r '.maps | keys[]' "$PREV" | LC_ALL=C sort > "$tmp_prev"
+          else
+            : > "$tmp_prev"
+          fi
+          
+          # removed = prev - current
+          tmp_removed=$(mktemp)
+          comm -13 "$tmp_all" "$tmp_prev" > "$tmp_removed" || true
+          
+          REMOVED='[]'
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            id="$(echo "$path" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
+            REMOVED=$(jq -c --arg path "$path" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$REMOVED")
+          done < "$tmp_removed"
+      
+          # Keep prev prefix available for the synthesize step
+          echo "prev_prefix=${{ steps.prev.outputs.prev_prefix }}" >> "$GITHUB_OUTPUT"
           
       # --- Render ONLY changed/new maps ---
       - name: Render & tile changed maps
@@ -242,8 +276,8 @@ jobs:
 
             jq -n \
               --arg id "$map_id" \
-              --arg tiles_base "data/tiles/$map_id" \
-              --arg minimaps_base "data/minimaps/$map_id" \
+              --arg tiles_base "${PUBLIC_BASE%/}/${S3_PREFIX}/data/tiles/$map_id" \
+              --arg minimaps_base "${PUBLIC_BASE%/}/${S3_PREFIX}/data/minimaps/$map_id" \
               --arg source_dmm "$rel" \
               --argjson z_levels "$zmeta" \
               '{map_id:$id, source_dmm:$source_dmm, tiles_base:$tiles_base, minimaps_base:$minimaps_base, z_levels:$z_levels}' \
@@ -275,7 +309,35 @@ jobs:
                '.tiles_base = $tb' "$tmp" > "$TILE_DIR/${map_id}/index.json"
             echo "::endgroup::"
           done
-
+      - name: Synthesize removed per-map indexes (carry forward from previous run)
+        if: steps.diff.outputs.any_changed == 'true' && steps.diff.outputs.prev_prefix != '' && steps.diff.outputs.removed != '[]'
+        shell: bash
+        env:
+          REMOVED:     ${{ steps.diff.outputs.removed }}
+          PREV_PREFIX: ${{ steps.diff.outputs.prev_prefix }}
+          PUBLIC_BASE: ${{ env.PUBLIC_BASE }}
+          TILE_DIR:    ${{ env.TILE_DIR }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p "$TILE_DIR"
+      
+          jq -c '.[]' <<< "$REMOVED" | while read -r m; do
+            rel=$(jq -r '.path' <<< "$m")
+            map_id=$(jq -r '.id'   <<< "$m")
+            echo "::group::Synthesizing (removed) $rel (id=$map_id)"
+            mkdir -p "$TILE_DIR/$map_id"
+            tmp=$(mktemp)
+            # Pull the prior per-map index
+            aws s3 cp "${S3_BUCKET%/}/${PREV_PREFIX}/data/tiles/${map_id}/index.json" "$tmp" --only-show-errors
+            # Rewrite bases to point at the prev prefix; mark removed:true
+            jq \
+              --arg tb "${PUBLIC_BASE%/}/${PREV_PREFIX}/data/tiles/${map_id}" \
+              --arg mb "${PUBLIC_BASE%/}/${PREV_PREFIX}/data/minimaps/${map_id}" \
+              '.tiles_base = $tb | .minimaps_base = $mb | .removed = true' \
+              "$tmp" > "$TILE_DIR/${map_id}/index.json"
+            echo "::endgroup::"
+          done
       # --- Per-run catalog over BOTH changed + synthesized indexes ---
       - name: Build per-run catalog (data/tiles/index.json)
         run: |
