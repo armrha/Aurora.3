@@ -2,13 +2,18 @@
 import argparse, json, sys
 
 def to_dict(data):
+    # Prefer nested 'maps' object if present
     if isinstance(data, dict):
-        # Already {path: hash}
+        inner = data.get("maps")
+        if isinstance(inner, dict):
+            return {str(k): str(v) for k, v in inner.items()}
+        # Otherwise assume it's already a {path: hash} mapping
         return {str(k): str(v) for k, v in data.items()}
     if isinstance(data, list):
         out = {}
         for item in data:
-            if not isinstance(item, dict): continue
+            if not isinstance(item, dict): 
+                continue
             k = item.get("path") or item.get("name") or item.get("file") or item.get("map")
             v = item.get("hash") or item.get("sha") or item.get("digest")
             if k and v:
@@ -45,13 +50,13 @@ def main():
     with open(args.summary_out, "w", encoding="utf-8") as f:
         f.write(f"added:{len(added)} removed:{len(removed)} changed:{len(changed)} same:{len(same)}\n")
 
-    # GitHub Actions outputs
-    ghout = []
-    ghout.append(f"any_changed={'true' if (changed or added or removed) else 'false'}")
-    ghout.append(f"changed_count={len(changed)}")
-    ghout.append(f"added_count={len(added)}")
-    ghout.append(f"removed_count={len(removed)}")
-    print("\n".join(ghout))
+    # Emit handy booleans/counts for GH outputs
+    print("\n".join([
+        f"any_changed={'true' if (changed or added or removed) else 'false'}",
+        f"changed_count={len(changed)}",
+        f"added_count={len(added)}",
+        f"removed_count={len(removed)}",
+    ]))
 
 if __name__ == "__main__":
     sys.exit(main())
