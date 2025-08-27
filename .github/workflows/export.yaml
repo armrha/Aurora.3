@@ -14,6 +14,7 @@ env:
   OUT_DIR: data/minimaps
   TILE_DIR: data/tiles
   S3_BUCKET: s3://aurora-webtilesbucket
+  S3_PREFIX: ''
   PUBLIC_BASE: https://aurora-webtilesbucket.s3.amazonaws.com
 
 jobs:
