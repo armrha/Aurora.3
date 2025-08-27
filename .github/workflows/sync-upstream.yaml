@@ -2,7 +2,7 @@ name: Sync Fork from Upstream
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 min; adjust as you like
+    - cron: "0 * * * *"   # every 30 min; adjust as you like
   workflow_dispatch: {}
 
 jobs:
@@ -33,6 +33,7 @@ jobs:
           else
             echo "PUSHED=false" >> $GITHUB_ENV
           fi
-
+      
       - name: Summary
-        run: echo "Pushed: $PUSHED"
+        run: |
+          echo "Pushed: $PUSHED"
