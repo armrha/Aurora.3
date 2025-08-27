@@ -188,71 +188,78 @@ jobs:
               cat changed_maps.txt || echo "No changed maps"
               echo "::endgroup::"
 
-      # --- Compare current vs previous and build CHANGED/UNCHANGED outputs ---
-      - name: Compare map hashes and build change lists
-        id: diff
-        shell: bash
-        run: |
-          set -euo pipefail
-          CUR="${{ steps.curhash.outputs.current_hash_file }}"
-          PREV="${{ steps.prevhash.outputs.prev_hash_file }}"
-          touch changed_maps.txt
-      
-          if [ -n "${PREV}" ]; then
-            echo "::group::Hash diff"
-            python .github/scripts/compare_map_hashes.py "$PREV" "$CUR" \
-              --changed-out changed_maps.txt --summary-out hash_diff_summary.txt | tee hashdiff.out
-            echo "::endgroup::"
-          else
-            # No previous: treat everything as changed
-            jq -r '.maps | keys[]' "$CUR" > changed_maps.txt
-            printf "added:0 removed:0 changed:%s same:0\n" "$(wc -l < changed_maps.txt | tr -d ' ')" > hash_diff_summary.txt
-            printf "any_changed=true\nchanged_count=%s\nadded_count=0\nremoved_count=0\n" "$(wc -l < changed_maps.txt | tr -d ' ')" > hashdiff.out
-          fi
-      
-          echo "---- summary ----"
-          cat hash_diff_summary.txt
-      
-          # Build CHANGED JSON [{path,id}]
-          CHANGED='[]'
-          while IFS= read -r path; do
-            [ -z "$path" ] && continue
-            id="$(echo "$path" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
-            CHANGED=$(jq -c --arg path "$path" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$CHANGED")
-          done < changed_maps.txt
-      
-          # Build UNCHANGED JSON by set-diff against current keys
-          tmp_all=$(mktemp)
-          jq -r '.maps | keys[]' "$CUR" | LC_ALL=C sort > "$tmp_all"
-          tmp_chg=$(mktemp)
-          LC_ALL=C sort changed_maps.txt > "$tmp_chg"
-          tmp_unchanged=$(mktemp)
-          comm -23 "$tmp_all" "$tmp_chg" > "$tmp_unchanged"
-      
-          UNCHANGED='[]'
-          while IFS= read -r path; do
-            [ -z "$path" ] && continue
-            id="$(echo "$path" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
-            UNCHANGED=$(jq -c --arg path "$path" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$UNCHANGED")
-          done < "$tmp_unchanged"
-      
-          {
-            echo "changed<<JSON"
-            jq -c . <<<"$CHANGED"
-            echo "JSON"
-            echo "unchanged<<JSON"
-            jq -c . <<<"$UNCHANGED"
-            echo "JSON"
-          } >> "$GITHUB_OUTPUT"
-      
-          # Bubble up prev prefix for later synthesis step
-          echo "prev_prefix=${{ steps.prev.outputs.prev_prefix }}" >> "$GITHUB_OUTPUT"
-      
-          # Also bubble up booleans/counts if you want to gate later steps
-          while IFS='=' read -r k v; do
-            echo "$k=$v" >> "$GITHUB_OUTPUT"
-          done < hashdiff.out
-
+          # --- Compare current vs previous and build CHANGED/UNCHANGED outputs ---
+          - name: Compare map hashes and build change lists
+            id: diff
+            shell: bash
+            run: |
+              set -euo pipefail
+              set -x
+          
+              CUR="${{ steps.curhash.outputs.cur_hash_file }}"
+              PREV="${{ steps.prevhash.outputs.prev_hash_file }}"
+          
+              echo "CUR file: $CUR"
+              echo "PREV file: ${PREV:-<none>}"
+          
+              touch changed_maps.txt
+          
+              if [ -n "${PREV:-}" ] && [ -f "$PREV" ]; then
+                echo "::group::Hash diff"
+                python3 .github/scripts/compare_map_hashes.py "$PREV" "$CUR" \
+                  --changed-out changed_maps.txt --summary-out hash_diff_summary.txt | tee hashdiff.out
+                echo "::endgroup::"
+              else
+                # No previous: treat everything as changed
+                jq -r '.maps | keys[]' "$CUR" > changed_maps.txt
+                printf "added:0 removed:0 changed:%s same:0\n" "$(wc -l < changed_maps.txt | tr -d ' ')" > hash_diff_summary.txt
+                printf "any_changed=true\nchanged_count=%s\nadded_count=0\nremoved_count=0\n" "$(wc -l < changed_maps.txt | tr -d ' ')" > hashdiff.out
+              fi
+          
+              echo "---- summary ----"
+              cat hash_diff_summary.txt
+          
+              echo "::group::DEBUG changed_maps.txt"
+              nl -ba changed_maps.txt || true
+              echo "::endgroup::"
+          
+              # Build CHANGED JSON [{path,id}]
+              CHANGED='[]'
+              while IFS= read -r path; do
+                [ -z "$path" ] && continue
+                id="$(echo "$path" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
+                CHANGED=$(jq -c --arg path "$path" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$CHANGED")
+              done < changed_maps.txt
+          
+              # Build UNCHANGED via set difference
+              tmp_all=$(mktemp); jq -r '.maps | keys[]' "$CUR" | LC_ALL=C sort > "$tmp_all"
+              tmp_chg=$(mktemp); LC_ALL=C sort changed_maps.txt > "$tmp_chg"
+              tmp_unchanged=$(mktemp); comm -23 "$tmp_all" "$tmp_chg" > "$tmp_unchanged"
+          
+              UNCHANGED='[]'
+              while IFS= read -r path; do
+                [ -z "$path" ] && continue
+                id="$(echo "$path" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
+                UNCHANGED=$(jq -c --arg path "$path" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$UNCHANGED")
+              done < "$tmp_unchanged"
+          
+              {
+                echo "changed<<JSON"
+                jq -c . <<<"$CHANGED"
+                echo "JSON"
+                echo "unchanged<<JSON"
+                jq -c . <<<"$UNCHANGED"
+                echo "JSON"
+              } >> "$GITHUB_OUTPUT"
+          
+              echo "prev_prefix=${{ steps.prev.outputs.prev_prefix }}" >> "$GITHUB_OUTPUT"
+          
+              # Bubble comparator booleans/counts if present
+              if [ -f hashdiff.out ]; then
+                while IFS='=' read -r k v; do
+                  echo "$k=$v" >> "$GITHUB_OUTPUT"
+                done < hashdiff.out
+              fi
       # --- Render ONLY changed/new maps ---
       - name: Render & tile changed maps
         if: steps.diff.outputs.changed != '[]'
