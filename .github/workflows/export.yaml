@@ -117,7 +117,7 @@ jobs:
 
       # --- Render ONLY changed/new maps ---
       - name: Render & tile changed maps
-        if: ${{ fromJSON(steps.diff.outputs.changed) != null && (fromJSON(steps.diff.outputs.changed) | length) > 0 }}
+        if: fromJSON(steps.diff.outputs.changed) != null && length(fromJSON(steps.diff.outputs.changed)) > 0
         shell: bash
         env:
           CHANGED: ${{ steps.diff.outputs.changed }}
@@ -170,7 +170,7 @@ jobs:
 
       # --- Synthesize per-map indexes for UNCHANGED maps (point to previous tiles) ---
       - name: Synthesize unchanged per-map indexes (point to previous run)
-        if: ${{ steps.diff.outputs.prev_prefix != '' && fromJSON(steps.diff.outputs.unchanged) != null && (fromJSON(steps.diff.outputs.unchanged) | length) > 0 }}
+        if: steps.diff.outputs.prev_prefix != '' && fromJSON(steps.diff.outputs.unchanged) != null && length(fromJSON(steps.diff.outputs.unchanged)) > 0
         shell: bash
         env:
           UNCHANGED:  ${{ steps.diff.outputs.unchanged }}
@@ -225,7 +225,7 @@ jobs:
 
       # --- Upload (tiles for CHANGED only), then JSON indices and hashes ---
       - name: Upload tiles (changed only; immutable)
-        if: ${{ fromJSON(steps.diff.outputs.changed) != null && (fromJSON(steps.diff.outputs.changed) | length) > 0 }}
+        if: fromJSON(steps.diff.outputs.changed) != null && length(fromJSON(steps.diff.outputs.changed)) > 0
         shell: bash
         env:
           CHANGED: ${{ steps.diff.outputs.changed }}
