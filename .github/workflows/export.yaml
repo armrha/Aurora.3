@@ -114,6 +114,53 @@ jobs:
           done
       
           echo "current_hash_file=map_hashes.json" >> "$GITHUB_OUTPUT"
+          
+          - name: Compare map hashes and build change lists
+            id: diff
+            shell: bash
+            run: |
+              set -euo pipefail
+          
+              CUR="${{ steps.curhash.outputs.cur_hash_file }}"
+              PREV="${{ steps.prevhash.outputs.prev_hash_file }}"
+          
+              echo "::group::DEBUG current map_hashes.json ($CUR)"
+              if [ -f "$CUR" ]; then
+                echo "File size: $(stat -c%s "$CUR") bytes"
+                head -n 400 "$CUR"
+              else
+                echo "MISSING $CUR"
+              fi
+              echo "::endgroup::"
+          
+              echo "::group::DEBUG previous map_hashes.json ($PREV)"
+              if [ -n "$PREV" ] && [ -f "$PREV" ]; then
+                echo "File size: $(stat -c%s "$PREV") bytes"
+                head -n 400 "$PREV"
+              else
+                echo "MISSING $PREV"
+              fi
+              echo "::endgroup::"
+          
+              if [ -z "$PREV" ]; then
+                echo "No previous hash file, treat all as changed."
+                jq -r '.maps | keys[]' "$CUR" > changed_maps.txt
+              else
+                echo "Hash diff"
+                python .github/scripts/compare_map_hashes.py "$PREV" "$CUR" \
+                  --changed-out changed_maps.txt --summary-out hash_diff_summary.txt | tee hashdiff.out
+              fi
+          
+              echo "---- summary ----"
+              if [ -f hash_diff_summary.txt ]; then
+                cat hash_diff_summary.txt
+              else
+                echo "No summary produced"
+              fi
+          
+              echo "::group::DEBUG changed_maps.txt"
+              cat changed_maps.txt || echo "No changed maps"
+              echo "::endgroup::"
 
       # --- Compare current vs previous and build CHANGED/UNCHANGED outputs ---
       - name: Compare map hashes and build change lists
