@@ -223,10 +223,12 @@ jobs:
             jq --arg p "$f" --arg h "$h" '.maps[$p]=$h' map_hashes.json > x && mv x map_hashes.json
           done < <(find maps _maps -type f -name '*.dmm' -print0 2>/dev/null)
           cat map_hashes.json
-
-      # --- Upload (tiles for CHANGED only), then JSON indices and hashes ---
-      - name: Upload tiles (changed only; immutable)
-        if: steps.diff.outputs.unchanged != '[]' && steps.diff.outputs.prev_prefix != ''
+      - run: |
+          echo "Changed count: $(jq -r 'length' <<< '${{ steps.diff.outputs.changed }}')"
+          echo "Unchanged count: $(jq -r 'length' <<< '${{ steps.diff.outputs.unchanged }}')"
+      # --- Upload tiles (CHANGED only) ---
+      - name: Upload tiles (changed only)
+        if: steps.diff.outputs.changed != '[]'
         shell: bash
         env:
           CHANGED: ${{ steps.diff.outputs.changed }}
