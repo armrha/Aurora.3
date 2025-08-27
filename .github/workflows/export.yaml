@@ -61,15 +61,12 @@ jobs:
           role-to-assume: arn:aws:iam::676973469311:role/AuroraWebTilesBucketOIDC
           aws-region: us-west-2
 
-      # --- discover previous run & compute change set ---
-      - name: Load previous run & build change list
-        id: diff
+      # --- Discover previous run prefix (unchanged from you) ---
+      - name: Fetch previous runs.json
+        id: prev
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
-
-          echo "::group::Fetch previous runs.json"
           PREV_PREFIX=""
           tmp_runs=$(mktemp)
           if aws s3 cp "${S3_BUCKET%/}/aurora-tiles/runs.json" "$tmp_runs" --only-show-errors; then
@@ -78,52 +75,70 @@ jobs:
           else
             echo "No previous runs.json found."
           fi
-          echo "::endgroup::"
           echo "prev_prefix=$PREV_PREFIX" >> "$GITHUB_OUTPUT"
-
-          # Load previous map hashes (normalize keys)
-          declare -A PREV
-          if [ -n "$PREV_PREFIX" ]; then
-            echo "::group::Fetch previous map_hashes.json"
-            tmp_hash=$(mktemp)
-            if aws s3 cp "${S3_BUCKET%/}/${PREV_PREFIX}/data/tiles/map_hashes.json" "$tmp_hash" --only-show-errors; then
-              while IFS= read -r k && IFS= read -r v <&3; do
-                k="${k#./}"
-                PREV["$k"]="$v"
-              done < <(jq -r '.maps | keys[]' "$tmp_hash") 3< <(jq -r '.maps[]' "$tmp_hash")
-              echo "Loaded previous hashes: $(jq -r '(.maps|keys|length|tostring)+" keys"' "$tmp_hash")"
-            else
-              echo "No previous map_hashes.json at ${PREV_PREFIX}."
-            fi
-            echo "::endgroup::"
+      
+      # --- Download previous map_hashes.json if it exists ---
+      - name: Fetch previous map_hashes.json
+        id: prevhash
+        if: steps.prev.outputs.prev_prefix != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          if aws s3 cp "${S3_BUCKET%/}/${{ steps.prev.outputs.prev_prefix }}/data/tiles/map_hashes.json" prev_map_hashes.json --only-show-errors; then
+            echo "prev_hash_file=prev_map_hashes.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "prev_hash_file=" >> "$GITHUB_OUTPUT"
+            echo "No previous map_hashes.json found at prefix."
           fi
 
-          # Gather current .dmm files
-          files=()
-          [ -d maps  ]  && while IFS= read -r -d '' f; do files+=("$f"); done < <(find maps  -type f -name '*.dmm' -print0 || true)
-          [ -d _maps ] && while IFS= read -r -d '' f; do files+=("$f"); done < <(find _maps -type f -name '*.dmm' -print0 || true)
-          [ ${#files[@]} -gt 0 ] || { echo "No .dmm maps found"; exit 1; }
-
+      # --- Compare current vs previous and build CHANGED/UNCHANGED outputs ---
+      - name: Compare map hashes and build change lists
+        id: diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          CUR="map_hashes.json"
+          PREV="${{ steps.prevhash.outputs.prev_hash_file }}"
+          touch changed_maps.txt
+      
+          if [ -n "${PREV}" ]; then
+            echo "::group::Hash diff"
+            python .github/scripts/compare_map_hashes.py "$PREV" "$CUR" \
+              --changed-out changed_maps.txt --summary-out hash_diff_summary.txt | tee hashdiff.out
+            echo "::endgroup::"
+          else
+            # No previous: treat everything as changed
+            jq -r '.maps | keys[]' "$CUR" > changed_maps.txt
+            printf "added:0 removed:0 changed:%s same:0\n" "$(wc -l < changed_maps.txt | tr -d ' ')" > hash_diff_summary.txt
+            printf "any_changed=true\nchanged_count=%s\nadded_count=0\nremoved_count=0\n" "$(wc -l < changed_maps.txt | tr -d ' ')" > hashdiff.out
+          fi
+      
+          echo "---- summary ----"
+          cat hash_diff_summary.txt
+      
+          # Build CHANGED JSON [{path,id}]
           CHANGED='[]'
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            id="$(echo "$path" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
+            CHANGED=$(jq -c --arg path "$path" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$CHANGED")
+          done < changed_maps.txt
+      
+          # Build UNCHANGED JSON by set-diff against current keys
+          tmp_all=$(mktemp)
+          jq -r '.maps | keys[]' "$CUR" | LC_ALL=C sort > "$tmp_all"
+          tmp_chg=$(mktemp)
+          LC_ALL=C sort changed_maps.txt > "$tmp_chg"
+          tmp_unchanged=$(mktemp)
+          comm -23 "$tmp_all" "$tmp_chg" > "$tmp_unchanged"
+      
           UNCHANGED='[]'
-
-          echo "::group::Per-file diff (path | current-hash | previous-hash | verdict)"
-          for f in "${files[@]}"; do
-            rel="${f#./}"
-            id="$(echo "$rel" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
-            cur=$(git hash-object "$f" || git hash-object "$rel")
-            prev="${PREV[$rel]-}"
-            if [ -n "$prev" ] && [ "$prev" = "$cur" ]; then
-              printf "%s | %s | %s | UNCHANGED\n" "$rel" "$cur" "$prev"
-              UNCHANGED=$(jq -c --arg path "$rel" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$UNCHANGED")
-            else
-              verdict="CHANGED"; [ -z "$prev" ] && verdict="CHANGED(missing-prev)"
-              printf "%s | %s | %s | %s\n" "$rel" "$cur" "${prev:-(none)}" "$verdict"
-              CHANGED=$(jq -c --arg path "$rel" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$CHANGED")
-            fi
-          done
-          echo "::endgroup::"
-
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            id="$(echo "$path" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
+            UNCHANGED=$(jq -c --arg path "$path" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$UNCHANGED")
+          done < "$tmp_unchanged"
+      
           {
             echo "changed<<JSON"
             jq -c . <<<"$CHANGED"
@@ -132,9 +147,14 @@ jobs:
             jq -c . <<<"$UNCHANGED"
             echo "JSON"
           } >> "$GITHUB_OUTPUT"
-
-          echo "Changed:   $(jq -r 'length' <<<"$CHANGED")"
-          echo "Unchanged: $(jq -r 'length' <<<"$UNCHANGED")"
+      
+          # Bubble up prev prefix for later synthesis step
+          echo "prev_prefix=${{ steps.prev.outputs.prev_prefix }}" >> "$GITHUB_OUTPUT"
+      
+          # Also bubble up booleans/counts if you want to gate later steps
+          while IFS='=' read -r k v; do
+            echo "$k=$v" >> "$GITHUB_OUTPUT"
+          done < hashdiff.out
 
       # --- Render ONLY changed/new maps ---
       - name: Render & tile changed maps
@@ -237,20 +257,29 @@ jobs:
             > "$TILE_DIR/index.json"
           rm -f "$tmp"
 
-      # --- Compute & upload map_hashes.json for THIS run ---
+# --- Compute map_hashes.json (git blob hashes of .dmm), deterministic order ---
       - name: Compute map_hashes.json (git blob hashes of .dmm)
+        id: curhash
+        shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
+      
           jq -n --arg commit "$GITHUB_SHA" --arg gen "$(date -u +%FT%TZ)" \
             '{commit_full:$commit, generated_at:$gen, maps:{}}' > map_hashes.json
-
-          while IFS= read -r -d '' f; do
+      
+          # Gather files in a stable order
+          files=()
+          [ -d maps  ]  && while IFS= read -r f; do files+=("$f"); done < <(find maps  -type f -name '*.dmm' | LC_ALL=C sort)
+          [ -d _maps ] && while IFS= read -r f; do files+=("$f"); done < <(find _maps -type f -name '*.dmm' | LC_ALL=C sort)
+      
+          for f in "${files[@]}"; do
             rel="${f#./}"
             h=$(git hash-object "$f")
             jq --arg p "$rel" --arg h "$h" '.maps[$p]=$h' map_hashes.json > x && mv x map_hashes.json
-          done < <(find maps _maps -type f -name '*.dmm' -print0 2>/dev/null)
-          cat map_hashes.json
+          done
+      
+          echo "current_hash_file=map_hashes.json" >> "$GITHUB_OUTPUT"
 
       - name: Diff counts (debug)
         run: |
