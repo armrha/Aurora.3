@@ -91,13 +91,37 @@ jobs:
             echo "No previous map_hashes.json found at prefix."
           fi
 
+      # --- Compute map_hashes.json (git blob hashes of .dmm), deterministic order ---
+      - name: Compute map_hashes.json (git blob hashes of .dmm)
+        id: curhash
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+      
+          jq -n --arg commit "$GITHUB_SHA" --arg gen "$(date -u +%FT%TZ)" \
+            '{commit_full:$commit, generated_at:$gen, maps:{}}' > map_hashes.json
+      
+          # Gather files in a stable order
+          files=()
+          [ -d maps  ]  && while IFS= read -r f; do files+=("$f"); done < <(find maps  -type f -name '*.dmm' | LC_ALL=C sort)
+          [ -d _maps ] && while IFS= read -r f; do files+=("$f"); done < <(find _maps -type f -name '*.dmm' | LC_ALL=C sort)
+      
+          for f in "${files[@]}"; do
+            rel="${f#./}"
+            h=$(git hash-object "$f")
+            jq --arg p "$rel" --arg h "$h" '.maps[$p]=$h' map_hashes.json > x && mv x map_hashes.json
+          done
+      
+          echo "current_hash_file=map_hashes.json" >> "$GITHUB_OUTPUT"
+
       # --- Compare current vs previous and build CHANGED/UNCHANGED outputs ---
       - name: Compare map hashes and build change lists
         id: diff
         shell: bash
         run: |
           set -euo pipefail
-          CUR="map_hashes.json"
+          CUR="${{ steps.curhash.outputs.current_hash_file }}"
           PREV="${{ steps.prevhash.outputs.prev_hash_file }}"
           touch changed_maps.txt
       
@@ -256,30 +280,6 @@ jobs:
             '{generated_at:$generated, tile_size:$tile, maps:$maps[0]}' \
             > "$TILE_DIR/index.json"
           rm -f "$tmp"
-
-# --- Compute map_hashes.json (git blob hashes of .dmm), deterministic order ---
-      - name: Compute map_hashes.json (git blob hashes of .dmm)
-        id: curhash
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-      
-          jq -n --arg commit "$GITHUB_SHA" --arg gen "$(date -u +%FT%TZ)" \
-            '{commit_full:$commit, generated_at:$gen, maps:{}}' > map_hashes.json
-      
-          # Gather files in a stable order
-          files=()
-          [ -d maps  ]  && while IFS= read -r f; do files+=("$f"); done < <(find maps  -type f -name '*.dmm' | LC_ALL=C sort)
-          [ -d _maps ] && while IFS= read -r f; do files+=("$f"); done < <(find _maps -type f -name '*.dmm' | LC_ALL=C sort)
-      
-          for f in "${files[@]}"; do
-            rel="${f#./}"
-            h=$(git hash-object "$f")
-            jq --arg p "$rel" --arg h "$h" '.maps[$p]=$h' map_hashes.json > x && mv x map_hashes.json
-          done
-      
-          echo "current_hash_file=map_hashes.json" >> "$GITHUB_OUTPUT"
 
       - name: Diff counts (debug)
         run: |
