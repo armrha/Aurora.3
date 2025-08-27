@@ -61,14 +61,14 @@ jobs:
           role-to-assume: arn:aws:iam::676973469311:role/AuroraWebTilesBucketOIDC
           aws-region: us-west-2
 
-      # --- NEW: discover previous run & compute change set ---
+      # --- discover previous run & compute change set ---
       - name: Load previous run & build change list
         id: diff
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-      
+
           echo "::group::Fetch previous runs.json"
           PREV_PREFIX=""
           tmp_runs=$(mktemp)
@@ -80,55 +80,50 @@ jobs:
           fi
           echo "::endgroup::"
           echo "prev_prefix=$PREV_PREFIX" >> "$GITHUB_OUTPUT"
-      
-          # Load previous map hashes (normalize keys by stripping leading './')
+
+          # Load previous map hashes (normalize keys)
           declare -A PREV
           if [ -n "$PREV_PREFIX" ]; then
             echo "::group::Fetch previous map_hashes.json"
             tmp_hash=$(mktemp)
             if aws s3 cp "${S3_BUCKET%/}/${PREV_PREFIX}/data/tiles/map_hashes.json" "$tmp_hash" --only-show-errors; then
               while IFS= read -r k && IFS= read -r v <&3; do
-                k="${k#./}"        # normalize
+                k="${k#./}"
                 PREV["$k"]="$v"
               done < <(jq -r '.maps | keys[]' "$tmp_hash") 3< <(jq -r '.maps[]' "$tmp_hash")
               echo "Loaded previous hashes: $(jq -r '(.maps|keys|length|tostring)+" keys"' "$tmp_hash")"
             else
-              echo "No previous map_hashes.json found at ${PREV_PREFIX}."
+              echo "No previous map_hashes.json at ${PREV_PREFIX}."
             fi
             echo "::endgroup::"
           fi
-      
+
           # Gather current .dmm files
           files=()
           [ -d maps  ]  && while IFS= read -r -d '' f; do files+=("$f"); done < <(find maps  -type f -name '*.dmm' -print0 || true)
           [ -d _maps ] && while IFS= read -r -d '' f; do files+=("$f"); done < <(find _maps -type f -name '*.dmm' -print0 || true)
           [ ${#files[@]} -gt 0 ] || { echo "No .dmm maps found"; exit 1; }
-      
+
           CHANGED='[]'
           UNCHANGED='[]'
-      
+
           echo "::group::Per-file diff (path | current-hash | previous-hash | verdict)"
           for f in "${files[@]}"; do
-            rel="${f#./}"  # normalized path
+            rel="${f#./}"
             id="$(echo "$rel" | sed -E 's/\.dmm$//; s/[^A-Za-z0-9._-]+/_/g')"
-            # Use the on-disk file for hashing (f is most robust, but rel works too)
             cur=$(git hash-object "$f" || git hash-object "$rel")
-      
             prev="${PREV[$rel]-}"
             if [ -n "$prev" ] && [ "$prev" = "$cur" ]; then
               printf "%s | %s | %s | UNCHANGED\n" "$rel" "$cur" "$prev"
               UNCHANGED=$(jq -c --arg path "$rel" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$UNCHANGED")
             else
-              # Helpful note if the key was missing vs hash mismatch
-              verdict="CHANGED"
-              [ -z "$prev" ] && verdict="CHANGED(missing-prev)"
+              verdict="CHANGED"; [ -z "$prev" ] && verdict="CHANGED(missing-prev)"
               printf "%s | %s | %s | %s\n" "$rel" "$cur" "${prev:-(none)}" "$verdict"
               CHANGED=$(jq -c --arg path "$rel" --arg id "$id" '. + [{path:$path,id:$id}]' <<<"$CHANGED")
             fi
           done
           echo "::endgroup::"
-      
-          # Emit outputs for later steps
+
           {
             echo "changed<<JSON"
             jq -c . <<<"$CHANGED"
@@ -137,61 +132,70 @@ jobs:
             jq -c . <<<"$UNCHANGED"
             echo "JSON"
           } >> "$GITHUB_OUTPUT"
-      
+
           echo "Changed:   $(jq -r 'length' <<<"$CHANGED")"
           echo "Unchanged: $(jq -r 'length' <<<"$UNCHANGED")"
-            # --- Render ONLY changed/new maps ---
-          - name: Render & tile changed maps
-            if: steps.diff.outputs.changed != '[]'
-            shell: bash
-            env:
-              CHANGED: ${{ steps.diff.outputs.changed }}
-            run: |
-              set -euo pipefail
-              shopt -s nullglob
-              mkdir -p "$OUT_DIR" "$TILE_DIR"
-    
-              jq -c '.[]' <<< "$CHANGED" | while read -r m; do
-                rel=$(jq -r '.path' <<< "$m")
-                map_id=$(jq -r '.id'   <<< "$m")
-                echo "::group::Rendering (changed) $rel  (id=$map_id)"
-    
-                out_map="$OUT_DIR/$map_id"
-                rm -rf "$out_map"; mkdir -p "$out_map"
-                dmm-tools minimap "$rel" -o "$out_map"
-    
-                rm -rf "$TILE_DIR/$map_id"; mkdir -p "$TILE_DIR/$map_id"
-                zmeta='[]'
-                for png in "$out_map"/*.png; do
-                  base="$(basename "$png")"
-                  z="${base%.*}"; z="${z##*-}"
-                  out="$TILE_DIR/$map_id/z$z"
-                  mkdir -p "$out"
-                  /usr/bin/convert "$png" \
-                    -colorspace sRGB -alpha on -type TrueColorAlpha -background none \
-                    -crop ${TILE}x${TILE} \
-                    -set filename:tile "%[fx:floor(page.y/${TILE})],%[fx:floor(page.x/${TILE})]" \
-                    +repage -gravity northwest -extent ${TILE}x${TILE} \
-                    +adjoin "$out/%[filename:tile].png"
-    
-                  w=$(/usr/bin/identify -format '%w' "$png"); h=$(/usr/bin/identify -format '%h' "$png")
-                  cols=$(( (w + TILE - 1) / TILE )); rows=$(( (h + TILE - 1) / TILE ))
-                  zmeta="$(jq -c --arg z "$z" --arg label "$(basename "$map_id") z$z" \
-                    --argjson w "$w" --argjson h "$h" --argjson rows "$rows" --argjson cols "$cols" --arg tile "$TILE" \
-                    '. + [{z:($z|tonumber), label:$label, width_px:$w, height_px:$h, rows:$rows, cols:$cols, tile_size:($tile|tonumber)}]' \
-                    <<< "$zmeta")"
-                done
-    
-                jq -n --arg id "$map_id" \
-                  --arg tiles_base "data/tiles/$map_id" \
-                  --arg minimaps_base "data/minimaps/$map_id" \
-                  --arg source_dmm "$rel" \
-                  --argjson z_levels "$zmeta" \
-                  '{map_id:$id, source_dmm:$source_dmm, tiles_base:$tiles_base, minimaps_base:$minimaps_base, z_levels:$z_levels}' \
-                  > "$TILE_DIR/$map_id/index.json"
-    
-                echo "::endgroup::"
-              done
+
+      # --- Render ONLY changed/new maps ---
+      - name: Render & tile changed maps
+        if: steps.diff.outputs.changed != '[]'
+        shell: bash
+        env:
+          CHANGED: ${{ steps.diff.outputs.changed }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p "$OUT_DIR" "$TILE_DIR"
+
+          jq -c '.[]' <<< "$CHANGED" | while read -r m; do
+            rel=$(jq -r '.path' <<< "$m")
+            map_id=$(jq -r '.id'   <<< "$m")
+            echo "::group::Rendering (changed) $rel  (id=$map_id)"
+
+            out_map="$OUT_DIR/$map_id"
+            rm -rf "$out_map"; mkdir -p "$out_map"
+            dmm-tools minimap "$rel" -o "$out_map"
+
+            rm -rf "$TILE_DIR/$map_id"; mkdir -p "$TILE_DIR/$map_id"
+            zmeta='[]'
+            for png in "$out_map"/*.png; do
+              base="$(basename "$png")"
+              z="${base%.*}"; z="${z##*-}"
+              out="$TILE_DIR/$map_id/z$z"
+              mkdir -p "$out"
+
+              /usr/bin/convert "$png" \
+                -colorspace sRGB -alpha on -type TrueColorAlpha -background none \
+                -crop ${TILE}x${TILE} \
+                -set filename:tile "%[fx:floor(page.y/${TILE})],%[fx:floor(page.x/${TILE})]" \
+                +repage -gravity northwest -extent ${TILE}x${TILE} \
+                +adjoin "$out/%[filename:tile].png"
+
+              w=$(/usr/bin/identify -format '%w' "$png")
+              h=$(/usr/bin/identify -format '%h' "$png")
+              cols=$(( (w + TILE - 1) / TILE ))
+              rows=$(( (h + TILE - 1) / TILE ))
+              # zmeta: single-line jq, numerics via --argjson
+              zmeta="$(jq -c \
+                --argjson z "$z" \
+                --arg label "$(basename "$map_id") z$z" \
+                --argjson w "$w" --argjson h "$h" \
+                --argjson rows "$rows" --argjson cols "$cols" \
+                --argjson tile "$TILE" \
+                '. + [{z:$z, label:$label, width_px:$w, height_px:$h, rows:$rows, cols:$cols, tile_size:$tile}]' <<<"$zmeta")"
+            done
+
+            jq -n \
+              --arg id "$map_id" \
+              --arg tiles_base "data/tiles/$map_id" \
+              --arg minimaps_base "data/minimaps/$map_id" \
+              --arg source_dmm "$rel" \
+              --argjson z_levels "$zmeta" \
+              '{map_id:$id, source_dmm:$source_dmm, tiles_base:$tiles_base, minimaps_base:$minimaps_base, z_levels:$z_levels}' \
+              > "$TILE_DIR/$map_id/index.json"
+
+            echo "::endgroup::"
+          done
 
       # --- Synthesize per-map indexes for UNCHANGED maps (point to previous tiles) ---
       - name: Synthesize unchanged per-map indexes (point to previous run)
@@ -204,6 +208,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           mkdir -p "$TILE_DIR"
+
           jq -c '.[]' <<< "$UNCHANGED" | while read -r m; do
             rel=$(jq -r '.path' <<< "$m")
             map_id=$(jq -r '.id'   <<< "$m")
@@ -226,9 +231,9 @@ jobs:
           jq -s '.' "$TILE_DIR"/*/index.json > "$tmp"
           jq -n \
             --arg generated "$(date -u +%FT%TZ)" \
-            --arg tile "$TILE" \
+            --argjson tile "$TILE" \
             --slurpfile maps "$tmp" \
-            '{generated_at:$generated, tile_size:($tile|tonumber), maps:$maps[0]}' \
+            '{generated_at:$generated, tile_size:$tile, maps:$maps[0]}' \
             > "$TILE_DIR/index.json"
           rm -f "$tmp"
 
@@ -239,16 +244,19 @@ jobs:
           shopt -s nullglob
           jq -n --arg commit "$GITHUB_SHA" --arg gen "$(date -u +%FT%TZ)" \
             '{commit_full:$commit, generated_at:$gen, maps:{}}' > map_hashes.json
-          
+
           while IFS= read -r -d '' f; do
-            rel="${f#./}"                                 # <-- normalize
+            rel="${f#./}"
             h=$(git hash-object "$f")
             jq --arg p "$rel" --arg h "$h" '.maps[$p]=$h' map_hashes.json > x && mv x map_hashes.json
           done < <(find maps _maps -type f -name '*.dmm' -print0 2>/dev/null)
           cat map_hashes.json
-      - run: |
+
+      - name: Diff counts (debug)
+        run: |
           echo "Changed count: $(jq -r 'length' <<< '${{ steps.diff.outputs.changed }}')"
           echo "Unchanged count: $(jq -r 'length' <<< '${{ steps.diff.outputs.unchanged }}')"
+
       # --- Upload tiles (CHANGED only) ---
       - name: Upload tiles (changed only)
         if: steps.diff.outputs.changed != '[]'
@@ -267,14 +275,12 @@ jobs:
 
       - name: Upload JSON indices (per-map + per-run + hashes)
         run: |
-          # Upload all per-map indexes and the per-run catalog for THIS run
           find "$TILE_DIR" -type f -name '*.json' -print0 | while IFS= read -r -d '' f; do
             aws s3 cp "$f" "${S3_BUCKET%/}/${S3_PREFIX}/${f}" \
               --only-show-errors \
               --content-type "application/json" \
               --cache-control "public, max-age=60, must-revalidate"
           done
-          # Upload hashes manifest
           aws s3 cp map_hashes.json "${S3_BUCKET%/}/${S3_PREFIX}/data/tiles/map_hashes.json" \
             --only-show-errors \
             --content-type "application/json" \
@@ -290,7 +296,7 @@ jobs:
           maps=$(find "$TILE_DIR" -mindepth 2 -maxdepth 2 -name index.json | wc -l | tr -d ' ')
           now=$(date -u +%FT%TZ)
           sha7=${GITHUB_SHA::7}
-      
+
           entry=$(jq -n \
             --arg prefix "$S3_PREFIX" \
             --arg branch "${GITHUB_REF_NAME}" \
@@ -300,29 +306,25 @@ jobs:
             --argjson bytes "$bytes" \
             --argjson maps "$maps" \
             '{prefix:$prefix, branch:$branch, commit:$commit, generated_at:$now, map_count:$maps, tile_count:$tiles, bytes:$bytes}')
-      
+
           tmp_old=$(mktemp)
           if aws s3 cp "${S3_BUCKET%/}/aurora-tiles/runs.json" "$tmp_old" --only-show-errors; then
             jq --argjson new "$entry" '
-              # stamp this merged file with current time (PARENS FIXED)
               .generated_at = (now | todateiso8601)
-              # prepend new run
               | .runs = ([ $new ] + (.runs // []))
-              # de-dup by .prefix using an object accumulator, then back to array
               | .runs = ((reduce .runs[] as $r ({}; .[$r.prefix] = $r)) | to_entries | map(.value))
-              # newest first
               | .runs = (.runs | sort_by(.generated_at) | reverse)
             ' "$tmp_old" > runs.json
           else
-            jq -n --arg gen "$now" --arg tile "$TILE" --argjson new "$entry" '
-              {generated_at:$gen, tile_size:($tile|tonumber), runs:[ $new ]}
-            ' > runs.json
+            jq -n --arg gen "$now" --argjson tile "$TILE" --argjson new "$entry" \
+              '{generated_at:$gen, tile_size:$tile, runs:[ $new ]}' > runs.json
           fi
-      
+
           aws s3 cp runs.json "${S3_BUCKET%/}/aurora-tiles/runs.json" \
             --only-show-errors \
             --content-type "application/json" \
             --cache-control "public, max-age=60, must-revalidate"
+
       - name: Where to read catalogs
         run: |
           echo "Per-run catalog:"
